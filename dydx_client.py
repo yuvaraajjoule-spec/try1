@@ -13,7 +13,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 # dYdX v4 client imports
-from dydx_v4_client import NodeClient, IndexerClient, MAX_CLIENT_ID
+from dydx_v4_client import NodeClient, MAX_CLIENT_ID
 from dydx_v4_client.indexer.rest.indexer_client import IndexerClient as RestIndexerClient
 from dydx_v4_client.network import MAINNET, make_testnet
 from dydx_v4_client.node.market import Market

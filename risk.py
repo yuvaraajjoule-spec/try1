@@ -66,9 +66,11 @@ def calculate_position_size(btc_price: float) -> float:
         size_btc = (POSITION_SIZE_USDC * LEVERAGE) / btc_price
 
     dYdX BTC-USD contract is denominated in BTC (step size = 0.0001 BTC).
+    Reads from cfg singleton so Telegram-changed values are respected live.
     """
-    usdc = float(os.getenv("POSITION_SIZE_USDC", 50))
-    leverage = float(os.getenv("LEVERAGE", 1))
+    from config import cfg  # late import to avoid circular dependency
+    usdc = float(cfg.position_size_usdc)
+    leverage = float(cfg.leverage)
     min_step = 0.0001
 
     size_btc = (usdc * leverage) / btc_price
