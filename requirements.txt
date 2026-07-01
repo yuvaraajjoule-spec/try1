@@ -1,6 +1,9 @@
 # dYdX v4 Python client
 dydx-v4-client>=0.4.0
 
+# Cosmos / crypto primitives (bundled with dydx-v4-client, listed for clarity)
+cosmpy>=0.9.0
+
 # Data processing (SMC logic)
 pandas>=2.0.0
 numpy>=1.24.0
@@ -8,12 +11,15 @@ numpy>=1.24.0
 # Environment variable loading
 python-dotenv>=1.0.0
 
-# HTTP & async (used by dydx client internally)
+# HTTP & async
 aiohttp>=3.9.0
 requests>=2.31.0
 
-# Logging utilities
+# Logging
 colorlog>=6.7.0
 
-# Scheduling
+# Telegram bot
+python-telegram-bot>=20.7
+
+# Scheduling (optional utility)
 schedule>=1.2.0
