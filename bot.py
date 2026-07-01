@@ -110,9 +110,10 @@ async def trading_loop(client: DydxClient):
     logger.info("=" * 60)
 
     await send_alert(
-        f"🤖 *dYdX Bot STARTED*\n"
-        f"Network: `{cfg.network}` | Symbol: `{cfg.symbol}`\n"
-        f"Dry Run: `{cfg.dry_run}`"
+        f"🤖 <b>dYdX Bot STARTED</b>\n"
+        f"Network: <code>{cfg.network.upper()}</code> | Symbol: <code>{cfg.symbol}</code>\n"
+        f"Dry Run: <code>{cfg.dry_run}</code>\n\n"
+        f"Send /start to open the control panel."
     )
 
     consecutive_errors = 0
@@ -147,9 +148,9 @@ async def trading_loop(client: DydxClient):
             # Alert on signal change
             if signal != 0 and signal != last_signal:
                 await send_alert(
-                    f"📡 *New Signal: {label}*\n"
-                    f"Price: `${latest_close:,.2f}`\n"
-                    f"Network: `{cfg.network}` | TF: `{cfg.candle_resolution}`"
+                    f"📡 <b>New Signal: {label}</b>\n"
+                    f"Price: <code>${latest_close:,.2f}</code>\n"
+                    f"Network: <code>{cfg.network.upper()}</code> | TF: <code>{cfg.candle_resolution}</code>"
                 )
             last_signal = signal
 
@@ -196,11 +197,12 @@ async def trading_loop(client: DydxClient):
 
                 dry = result.get("status") == "DRY_RUN"
                 await send_alert(
-                    f"{'🔵 [DRY RUN] ' if dry else ''}✅ *Order Placed*\n"
-                    f"Side  : `{order_side}`\n"
-                    f"Size  : `{size_btc} BTC`\n"
-                    f"Entry : `${entry_price:,.2f}`\n"
-                    f"SL    : `${sl_price:,.2f}` | TP: `${tp_price:,.2f}`"
+                    f"{'🔵 [DRY RUN] ' if dry else ''}✅ <b>Order Placed</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Side  : <code>{order_side}</code>\n"
+                    f"Size  : <code>{size_btc} BTC</code>\n"
+                    f"Entry : <code>${entry_price:,.2f}</code>\n"
+                    f"SL    : <code>${sl_price:,.2f}</code>  |  TP: <code>${tp_price:,.2f}</code>"
                 )
 
             consecutive_errors = 0
@@ -217,7 +219,7 @@ async def trading_loop(client: DydxClient):
                 exc_info=True,
             )
             if consecutive_errors >= MAX_ERRORS:
-                await send_alert(f"🚨 *CRITICAL: Bot stopped after {MAX_ERRORS} errors!*\n`{e}`")
+                await send_alert(f"🚨 <b>CRITICAL: Bot stopped after {MAX_ERRORS} errors!</b>\n<code>{e}</code>")
                 raise
 
             logger.info(f"Retry in {wait_time}s...")
@@ -264,8 +266,8 @@ async def sl_tp_monitor(client: DydxClient):
                 record_trade_pnl(pnl)
                 _clear_open_trade()
                 await send_alert(
-                    f"{tag} *hit!*\n"
-                    f"Price: `${price:,.2f}` | PnL: `${pnl:+.2f} USDC`"
+                    f"{tag} <b>hit!</b>\n"
+                    f"Price: <code>${price:,.2f}</code> | PnL: <code>${pnl:+.2f} USDC</code>"
                 )
 
         except Exception as e:

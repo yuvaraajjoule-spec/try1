@@ -1,414 +1,518 @@
 """
-telegram_bot.py — Telegram Control Interface
-Lets you control every aspect of the trading bot from Telegram.
+telegram_bot.py — Button-driven Telegram UI (no commands needed)
+Everything controlled via inline keyboard buttons on your phone.
 
-Commands:
-  /start        - Welcome & quick status
-  /status       - Full bot status + current position
-  /balance      - Account USDC balance
-  /position     - Open position details
-  /set <k> <v>  - Change a setting (leverage, sl, tp, etc.)
-  /settings     - Show all current settings
-  /pause        - Pause trading (no new entries)
-  /resume       - Resume trading
-  /close        - Force-close current position NOW
-  /dryrun       - Toggle dry-run mode
-  /network      - Switch mainnet ↔ testnet
-  /logs         - Last 25 log lines
-  /help         - This message
+Screens:
+  🏠 Dashboard  →  live price, position, P&L, signal
+  📊 Status     →  full account details
+  ⚙️ Settings   →  tap any setting to change it inline
+  🛡 Risk       →  pause, resume, dry run, close position
+  📄 Logs       →  last 25 log lines
 """
 
 import asyncio
 import logging
 import os
-from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Awaitable
+from datetime import datetime
+from typing import Optional
 
-from telegram import Update, BotCommand
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    Bot,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
+    ConversationHandler,
+    MessageHandler,
     CommandHandler,
     ContextTypes,
+    filters,
 )
 
 from config import cfg
 
-if TYPE_CHECKING:
-    from dydx_client import DydxClient
-
 logger = logging.getLogger(__name__)
-
 LOG_FILE = Path("logs/bot.log")
 
+# ── Conversation states ──────────────────────────────────────
+(
+    MAIN,
+    SETTINGS_MENU,
+    AWAITING_VALUE,
+    RISK_MENU,
+    LOGS_SCREEN,
+    CONFIRM_CLOSE,
+) = range(6)
 
-# -----------------------------------------------------------
-# Auth Guard — only respond to the owner's chat ID
-# -----------------------------------------------------------
+# Which setting key is being edited (stored in context.user_data)
+EDITING_KEY = "editing_key"
 
-def _authorized(update: Update) -> bool:
-    allowed = os.getenv("TELEGRAM_CHAT_ID", "")
-    if not allowed:
-        return True  # No restriction set — allow all (dev mode)
-    return str(update.effective_chat.id) == allowed.strip()
+# ── Auth ─────────────────────────────────────────────────────
 
+def _ok(update: Update) -> bool:
+    cid = os.getenv("TELEGRAM_CHAT_ID", "")
+    uid = str(
+        update.effective_chat.id
+        if update.effective_chat
+        else update.callback_query.message.chat.id
+    )
+    return not cid or uid == cid.strip()
 
-def owner_only(handler: Callable) -> Callable:
-    """Decorator: silently ignore messages from non-owners."""
-    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if not _authorized(update):
-            logger.warning(
-                f"Unauthorized Telegram access attempt from chat_id={update.effective_chat.id}"
-            )
-            await update.message.reply_text("⛔ Unauthorized.")
-            return
-        await handler(update, ctx)
-    wrapper.__name__ = handler.__name__
-    return wrapper
+# ── Keyboard builders ─────────────────────────────────────────
 
+def _kb(*rows):
+    """Build InlineKeyboardMarkup from rows of (text, callback_data) tuples."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(t, callback_data=d) for t, d in row]
+        for row in rows
+    ])
 
-# -----------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------
+def main_kb():
+    return _kb(
+        [("📊 Status", "status"), ("💰 Balance", "balance")],
+        [("📍 Position", "position"), ("📄 Logs", "logs")],
+        [("⚙️ Settings", "settings"), ("🛡 Risk", "risk")],
+        [("🔄 Refresh", "home")],
+    )
 
-def _fmt_bool(v: bool) -> str:
-    return "✅ ON" if v else "❌ OFF"
+def settings_kb():
+    lev  = cfg.leverage
+    size = cfg.position_size_usdc
+    sl   = f"{cfg.stop_loss_pct*100:.1f}%"
+    tp   = f"{cfg.take_profit_pct*100:.1f}%"
+    tf   = cfg.candle_resolution
+    net  = cfg.network.upper()
+    return _kb(
+        [("📐 Leverage", "set_leverage"),      (f"Now: {lev}x",          "noop")],
+        [("💵 Size (USDC)", "set_size"),        (f"Now: ${size}",         "noop")],
+        [("🛡 Stop Loss", "set_sl"),            (f"Now: {sl}",            "noop")],
+        [("🎯 Take Profit", "set_tp"),          (f"Now: {tp}",            "noop")],
+        [("⏱ Timeframe", "set_tf"),            (f"Now: {tf}",            "noop")],
+        [("📊 Candle Limit", "set_limit"),      (f"Now: {cfg.candle_limit}", "noop")],
+        [("⏰ Poll Interval", "set_interval"),  (f"Now: {cfg.poll_interval}s", "noop")],
+        [("💸 Max Daily Loss", "set_maxloss"),  (f"Now: ${cfg.max_daily_loss_usdc}", "noop")],
+        [("🌐 Network: " + net, "toggle_network")],
+        [("🏠 Back", "home")],
+    )
 
+def risk_kb():
+    paused  = cfg.paused
+    dry     = cfg.dry_run
+    p_label = "▶️ Resume Trading" if paused else "⏸ Pause Trading"
+    d_label = "🔴 Dry Run: ON"    if dry    else "🟢 Dry Run: OFF"
+    return _kb(
+        [(p_label, "toggle_pause")],
+        [(d_label,  "toggle_dryrun")],
+        [("❌ Close Position NOW", "confirm_close")],
+        [("🏠 Back", "home")],
+    )
 
-def _tail_log(n: int = 25) -> str:
+def confirm_kb():
+    return _kb(
+        [("✅ YES — Close it", "do_close"), ("❌ Cancel", "risk")],
+    )
+
+def back_kb():
+    return _kb([("🏠 Home", "home")])
+
+def logs_kb():
+    return _kb(
+        [("🔄 Refresh Logs", "logs"), ("🏠 Home", "home")],
+    )
+
+# ── Text builders ─────────────────────────────────────────────
+
+def _bool_icon(v: bool) -> str:
+    return "✅" if v else "❌"
+
+async def _dashboard_text(client=None) -> str:
+    now = datetime.utcnow().strftime("%H:%M:%S UTC")
+    price_str = "—"
+    pos_str   = "📍 <i>No open position</i>"
+    bal_str   = "—"
+
+    if client:
+        try:
+            ob  = await client.get_orderbook()
+            mid = (ob.get("bid", 0) + ob.get("ask", 0)) / 2
+            price_str = f"${mid:,.2f}"
+        except Exception:
+            pass
+        try:
+            acc   = await client.get_account()
+            equity = float(acc.get("equity", 0))
+            bal_str = f"${equity:,.2f} USDC"
+        except Exception:
+            pass
+        try:
+            pos = await client.get_position()
+            if pos:
+                side  = pos.get("side", "?")
+                size  = pos.get("size", "?")
+                entry = float(pos.get("entryPrice", 0))
+                upnl  = float(pos.get("unrealizedPnl", 0))
+                emoji = "🟢" if upnl >= 0 else "🔴"
+                pos_str = (
+                    f"{emoji} <b>{side}</b> {size} BTC\n"
+                    f"   Entry: <code>${entry:,.2f}</code> | uPnL: <code>${upnl:+.2f}</code>"
+                )
+        except Exception:
+            pass
+
+    paused_tag = " | ⏸ <b>PAUSED</b>" if cfg.paused    else ""
+    dry_tag    = " | 🔵 <b>DRY RUN</b>" if cfg.dry_run  else ""
+
+    return (
+        f"🤖 <b>dYdX SMC Bot</b>  <i>{now}</i>{paused_tag}{dry_tag}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌐 Network  : <code>{cfg.network.upper()}</code>\n"
+        f"📈 Market   : <code>{cfg.symbol}</code>\n"
+        f"⏱ Timeframe: <code>{cfg.candle_resolution}</code>\n"
+        f"📐 Leverage : <code>{cfg.leverage}x</code>  |  💵 <code>${cfg.position_size_usdc}</code>\n"
+        f"🛡 SL: <code>{cfg.stop_loss_pct*100:.1f}%</code>  |  "
+        f"🎯 TP: <code>{cfg.take_profit_pct*100:.1f}%</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Balance  : <code>{bal_str}</code>\n"
+        f"₿  BTC Price: <code>{price_str}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{pos_str}"
+    )
+
+def _settings_text() -> str:
+    return (
+        "⚙️ <b>Settings</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Tap any row to change its value.\n"
+        "The current value is shown on the right button.\n\n"
+        "<i>Changes apply on the very next trade cycle.</i>"
+    )
+
+def _risk_text() -> str:
+    return (
+        "🛡 <b>Risk Controls</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Paused   : {_bool_icon(cfg.paused)}  {'Bot is NOT taking new trades.' if cfg.paused else 'Bot is trading.'}\n"
+        f"Dry Run  : {_bool_icon(cfg.dry_run)}  {'No real orders sent.' if cfg.dry_run else 'LIVE orders active.'}\n"
+        f"Daily Loss Cap: <code>${cfg.max_daily_loss_usdc}</code>\n\n"
+        "<b>⚠️ Force Close</b> will send a market order immediately."
+    )
+
+def _logs_text() -> str:
     if not LOG_FILE.exists():
-        return "_No log file yet._"
+        return "📄 <b>Logs</b>\n\n<i>No log file found yet.</i>"
     lines = LOG_FILE.read_text(errors="replace").splitlines()
-    tail = lines[-n:] if len(lines) >= n else lines
-    return "\n".join(tail)
+    tail  = "\n".join(lines[-25:]) if len(lines) >= 25 else "\n".join(lines)
+    if len(tail) > 3600:
+        tail = "…(truncated)\n" + tail[-3600:]
+    return f"📄 <b>Logs</b> (last 25 lines)\n<pre>{tail}</pre>"
 
+# ── Helpers to send/edit safely ───────────────────────────────
 
-# -----------------------------------------------------------
-# Command Handlers
-# -----------------------------------------------------------
+async def _edit(update: Update, text: str, kb: InlineKeyboardMarkup):
+    """Edit the message that triggered the callback."""
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
-@owner_only
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "🤖 *dYdX SMC Trading Bot*\n\n"
-        f"Network : `{cfg.network}`\n"
-        f"Symbol  : `{cfg.symbol}`\n"
-        f"Paused  : {_fmt_bool(cfg.paused)}\n"
-        f"Dry Run : {_fmt_bool(cfg.dry_run)}\n\n"
-        "Type /help to see all commands."
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+# ── Handlers ──────────────────────────────────────────────────
 
+# Store client reference at module level (set in start_telegram_bot)
+_client = None
 
-@owner_only
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "📋 *Available Commands*\n\n"
-        "/status — Full bot status + position\n"
-        "/balance — USDC account balance\n"
-        "/position — Open position details\n"
-        "/settings — All current settings\n"
-        "/set `<key>` `<value>` — Change a setting\n"
-        "/pause — Pause trading\n"
-        "/resume — Resume trading\n"
-        "/close — Force-close position now\n"
-        "/dryrun — Toggle dry-run mode\n"
-        "/network — Switch mainnet ↔ testnet\n"
-        "/logs — Last 25 log lines\n\n"
-        "⚙️ *Settable Keys*\n"
-        "`leverage` — e.g. /set leverage 5\n"
-        "`position_size_usdc` — e.g. /set position_size_usdc 100\n"
-        "`stop_loss_pct` — e.g. /set stop_loss_pct 0.02\n"
-        "`take_profit_pct` — e.g. /set take_profit_pct 0.04\n"
-        "`candle_resolution` — e.g. /set candle_resolution 5MINS\n"
-        "`poll_interval` — e.g. /set poll_interval 30\n"
-        "`max_daily_loss_usdc` — e.g. /set max_daily_loss_usdc 200\n"
-        "`dry_run` — e.g. /set dry_run false\n"
-        "`network` — e.g. /set network testnet\n"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+async def _home(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _ok(update):
+        return MAIN
+    text = await _dashboard_text(_client)
+    if update.callback_query:
+        await _edit(update, text, main_kb())
+    else:
+        await update.message.reply_text(text, reply_markup=main_kb(), parse_mode=ParseMode.HTML)
+    return MAIN
 
+async def _status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _ok(update): return MAIN
+    text = await _dashboard_text(_client)
+    await _edit(update, text, main_kb())
+    return MAIN
 
-@owner_only
-async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    snap = cfg.snapshot()
-    lines = ["⚙️ *Current Settings*\n"]
-    skip = {"log_level"}
-    for k, v in snap.items():
-        if k in skip:
-            continue
-        if isinstance(v, bool):
-            lines.append(f"`{k}`: {_fmt_bool(v)}")
-        elif isinstance(v, float):
-            lines.append(f"`{k}`: `{v}`")
-        else:
-            lines.append(f"`{k}`: `{v}`")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-
-@owner_only
-async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Usage: /set <key> <value>"""
-    args = ctx.args
-    if not args or len(args) < 2:
-        await update.message.reply_text(
-            "Usage: `/set <key> <value>`\nExample: `/set leverage 5`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    key = args[0].strip().lower()
-    value = " ".join(args[1:]).strip()
-
+async def _balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _ok(update): return MAIN
     try:
-        result = cfg.set(key, value)
-        # If network changed, warn that reconnect is needed
-        if key == "network":
-            result += "\n\n⚠️ Network change requires a bot restart to take effect."
-        await update.message.reply_text(result, parse_mode=ParseMode.MARKDOWN)
-        logger.info(f"[Telegram] Config updated: {key} = {value}")
+        acc    = await _client.get_account()
+        equity = float(acc.get("equity", 0))
+        free   = float(acc.get("freeCollateral", 0))
+        text = (
+            f"💰 <b>Account Balance</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Total Equity     : <code>${equity:,.2f} USDC</code>\n"
+            f"Free Collateral  : <code>${free:,.2f} USDC</code>"
+        )
+    except Exception as e:
+        text = f"❌ Could not fetch balance:\n<code>{e}</code>"
+    await _edit(update, text, back_kb())
+    return MAIN
+
+async def _position(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _ok(update): return MAIN
+    try:
+        pos = await _client.get_position()
+        if pos is None:
+            text = "📍 <b>Position</b>\n\n<i>No open position.</i>"
+        else:
+            side  = pos.get("side", "?")
+            size  = pos.get("size", "?")
+            entry = float(pos.get("entryPrice", 0))
+            upnl  = float(pos.get("unrealizedPnl", 0))
+            liq   = pos.get("liquidationPrice", "N/A")
+            emoji = "🟢" if upnl >= 0 else "🔴"
+            text = (
+                f"📍 <b>Open Position</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Side        : {emoji} <b>{side}</b>\n"
+                f"Size        : <code>{size} BTC</code>\n"
+                f"Entry Price : <code>${entry:,.2f}</code>\n"
+                f"Unrealized PnL : <code>${upnl:+.2f} USDC</code>\n"
+                f"Liq. Price  : <code>${liq}</code>"
+            )
+    except Exception as e:
+        text = f"❌ Error:\n<code>{e}</code>"
+    await _edit(update, text, back_kb())
+    return MAIN
+
+async def _settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _ok(update): return SETTINGS_MENU
+    await _edit(update, _settings_text(), settings_kb())
+    return SETTINGS_MENU
+
+async def _risk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _ok(update): return RISK_MENU
+    await _edit(update, _risk_text(), risk_kb())
+    return RISK_MENU
+
+async def _logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _ok(update): return MAIN
+    await _edit(update, _logs_text(), logs_kb())
+    return MAIN
+
+# ── Setting input flow ────────────────────────────────────────
+
+_SET_PROMPTS = {
+    "set_leverage":  ("set_leverage",  "leverage",             "📐 Enter new leverage (1–20):\nExample: <code>5</code>"),
+    "set_size":      ("set_size",      "position_size_usdc",   "💵 Enter position size in USDC:\nExample: <code>100</code>"),
+    "set_sl":        ("set_sl",        "stop_loss_pct",        "🛡 Enter stop loss %:\nExample: <code>1.5</code> for 1.5%"),
+    "set_tp":        ("set_tp",        "take_profit_pct",      "🎯 Enter take profit %:\nExample: <code>3.0</code> for 3.0%"),
+    "set_tf":        ("set_tf",        "candle_resolution",    "⏱ Enter timeframe:\n<code>1MIN  5MINS  15MINS  30MINS  1HOUR  4HOURS  1DAY</code>"),
+    "set_limit":     ("set_limit",     "candle_limit",         "📊 Enter candle limit:\nExample: <code>100</code>"),
+    "set_interval":  ("set_interval",  "poll_interval",        "⏰ Enter poll interval in seconds:\nExample: <code>60</code>"),
+    "set_maxloss":   ("set_maxloss",   "max_daily_loss_usdc",  "💸 Enter max daily loss (USDC):\nExample: <code>100</code>"),
+}
+
+async def _start_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _ok(update): return SETTINGS_MENU
+    cb = update.callback_query.data
+    if cb not in _SET_PROMPTS:
+        await update.callback_query.answer()
+        return SETTINGS_MENU
+
+    _, cfg_key, prompt = _SET_PROMPTS[cb]
+    ctx.user_data[EDITING_KEY] = cfg_key
+
+    # For pct fields, show current value in readable %
+    cur = getattr(cfg, cfg_key)
+    if cfg_key in ("stop_loss_pct", "take_profit_pct"):
+        cur_str = f"{cur*100:.2f}%"
+    else:
+        cur_str = str(cur)
+
+    text = (
+        f"{prompt}\n\n"
+        f"Current value: <code>{cur_str}</code>\n\n"
+        f"<i>Type your new value below 👇</i>"
+    )
+    cancel_kb = _kb([("❌ Cancel", "settings")])
+    await _edit(update, text, cancel_kb)
+    return AWAITING_VALUE
+
+async def _receive_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _ok(update): return SETTINGS_MENU
+    raw     = update.message.text.strip()
+    cfg_key = ctx.user_data.get(EDITING_KEY)
+
+    if not cfg_key:
+        await update.message.reply_text("❌ Session lost. Go back to settings.", reply_markup=back_kb())
+        return MAIN
+
+    # For pct fields user types e.g. "1.5" meaning 1.5% → store as 0.015
+    try:
+        if cfg_key in ("stop_loss_pct", "take_profit_pct"):
+            numeric = float(raw)
+            if numeric > 1.0:
+                numeric = numeric / 100.0
+            result = cfg.set(cfg_key, numeric)
+        else:
+            result = cfg.set(cfg_key, raw)
+
+        text = (
+            f"✅ <b>Updated!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{result}\n\n"
+            f"<i>Change takes effect on the next trade cycle.</i>"
+        )
     except ValueError as e:
-        await update.message.reply_text(f"❌ {e}", parse_mode=ParseMode.MARKDOWN)
+        text = f"❌ <b>Invalid value</b>\n\n<code>{e}</code>"
 
+    ctx.user_data.pop(EDITING_KEY, None)
+    await update.message.reply_text(text, reply_markup=settings_kb(), parse_mode=ParseMode.HTML)
+    return SETTINGS_MENU
 
-@owner_only
-async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cfg.set("paused", True)
-    await update.message.reply_text(
-        "⏸ *Bot PAUSED*\nNo new trades will be entered. Existing position is unaffected.\nUse /resume to restart.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    logger.info("[Telegram] Bot paused by user.")
+# ── Toggle actions ────────────────────────────────────────────
 
+async def _toggle_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _ok(update): return RISK_MENU
+    cfg.set("paused", not cfg.paused)
+    await _edit(update, _risk_text(), risk_kb())
+    return RISK_MENU
 
-@owner_only
-async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cfg.set("paused", False)
-    await update.message.reply_text(
-        "▶️ *Bot RESUMED*\nTrading is now active.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    logger.info("[Telegram] Bot resumed by user.")
+async def _toggle_dryrun(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _ok(update): return RISK_MENU
+    cfg.set("dry_run", not cfg.dry_run)
+    state = "ON 🔵" if cfg.dry_run else "OFF 🟢 (LIVE)"
+    text = _risk_text() + f"\n\n<b>Dry Run is now {state}</b>"
+    await _edit(update, text, risk_kb())
+    return RISK_MENU
 
-
-@owner_only
-async def cmd_dryrun(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    new_val = not cfg.dry_run
-    cfg.set("dry_run", new_val)
-    status = "ON — no real orders will be placed" if new_val else "OFF — LIVE TRADING ACTIVE"
-    await update.message.reply_text(
-        f"🔁 *Dry Run toggled*\nDry Run is now: `{status}`",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    logger.info(f"[Telegram] Dry run set to {new_val}")
-
-
-@owner_only
-async def cmd_network(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    current = cfg.network
-    new_net = "testnet" if current == "mainnet" else "mainnet"
+async def _toggle_network(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _ok(update): return SETTINGS_MENU
+    new_net = "testnet" if cfg.network == "mainnet" else "mainnet"
     cfg.set("network", new_net)
-    await update.message.reply_text(
-        f"🌐 *Network switched*\n`{current}` → `{new_net}`\n\n"
-        "⚠️ Restart the bot for this to take effect:\n`sudo systemctl restart cryptotrade`",
-        parse_mode=ParseMode.MARKDOWN,
+    text = (
+        f"🌐 <b>Network switched!</b>\n\n"
+        f"Now: <code>{new_net.upper()}</code>\n\n"
+        f"⚠️ Reconnect required. On your Oracle VM run:\n"
+        f"<code>sudo systemctl restart cryptotrade</code>"
     )
-    logger.info(f"[Telegram] Network switched from {current} to {new_net}")
+    await _edit(update, text, _kb([("🏠 Home", "home"), ("⚙️ Settings", "settings")]))
+    return SETTINGS_MENU
 
+# ── Close position flow ───────────────────────────────────────
 
-@owner_only
-async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    tail = _tail_log(25)
-    # Telegram message limit is 4096 chars
-    if len(tail) > 3800:
-        tail = "...(truncated)\n" + tail[-3800:]
-    await update.message.reply_text(
-        f"📄 *Last log lines:*\n```\n{tail}\n```",
-        parse_mode=ParseMode.MARKDOWN,
+async def _confirm_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _ok(update): return RISK_MENU
+    text = (
+        "⚠️ <b>Confirm Close Position</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "This will send a <b>market order</b> to close your\n"
+        "current position immediately.\n\n"
+        "Are you sure?"
+    )
+    await _edit(update, text, confirm_kb())
+    return CONFIRM_CLOSE
+
+async def _do_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _ok(update): return RISK_MENU
+    await update.callback_query.answer("Closing position…")
+    try:
+        result = await _client.close_position()
+        if result is None:
+            text = "ℹ️ <b>No open position</b> to close."
+        elif result.get("status") == "DRY_RUN":
+            text = "🔵 <b>[DRY RUN]</b> Position close simulated. No real order sent."
+        else:
+            tx = result.get("tx_hash", "N/A")
+            text = f"✅ <b>Position Closed</b>\n\nTX Hash:\n<code>{tx}</code>"
+    except Exception as e:
+        text = f"❌ <b>Close failed</b>\n\n<code>{e}</code>"
+    await _edit(update, text, _kb([("🏠 Home", "home"), ("🛡 Risk", "risk")]))
+    return MAIN
+
+async def _noop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Absorb taps on 'current value' display buttons."""
+    await update.callback_query.answer("ℹ️ Tap the label on the left to change this value.")
+    return SETTINGS_MENU
+
+# ── Conversation wiring ───────────────────────────────────────
+
+def build_conversation() -> ConversationHandler:
+    """Build the full ConversationHandler with all states and transitions."""
+    set_triggers = [CallbackQueryHandler(_start_input, pattern=f"^{k}$") for k in _SET_PROMPTS]
+
+    return ConversationHandler(
+        entry_points=[CommandHandler("start", _home)],
+        states={
+            MAIN: [
+                CallbackQueryHandler(_home,          pattern="^home$"),
+                CallbackQueryHandler(_status,        pattern="^status$"),
+                CallbackQueryHandler(_balance,       pattern="^balance$"),
+                CallbackQueryHandler(_position,      pattern="^position$"),
+                CallbackQueryHandler(_settings,      pattern="^settings$"),
+                CallbackQueryHandler(_risk,          pattern="^risk$"),
+                CallbackQueryHandler(_logs,          pattern="^logs$"),
+            ],
+            SETTINGS_MENU: [
+                *set_triggers,
+                CallbackQueryHandler(_toggle_network, pattern="^toggle_network$"),
+                CallbackQueryHandler(_home,           pattern="^home$"),
+                CallbackQueryHandler(_noop,           pattern="^noop$"),
+                CallbackQueryHandler(_settings,       pattern="^settings$"),
+            ],
+            AWAITING_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _receive_value),
+                CallbackQueryHandler(_settings, pattern="^settings$"),
+            ],
+            RISK_MENU: [
+                CallbackQueryHandler(_toggle_pause,   pattern="^toggle_pause$"),
+                CallbackQueryHandler(_toggle_dryrun,  pattern="^toggle_dryrun$"),
+                CallbackQueryHandler(_confirm_close,  pattern="^confirm_close$"),
+                CallbackQueryHandler(_home,           pattern="^home$"),
+                CallbackQueryHandler(_risk,           pattern="^risk$"),
+            ],
+            CONFIRM_CLOSE: [
+                CallbackQueryHandler(_do_close, pattern="^do_close$"),
+                CallbackQueryHandler(_risk,     pattern="^risk$"),
+            ],
+            LOGS_SCREEN: [
+                CallbackQueryHandler(_logs, pattern="^logs$"),
+                CallbackQueryHandler(_home, pattern="^home$"),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("start", _home),
+            CallbackQueryHandler(_home, pattern="^home$"),
+        ],
+        per_message=False,
+        allow_reentry=True,
     )
 
-
-# -----------------------------------------------------------
-# Commands that need dYdX client access
-# These are registered with a closure that captures `client`
-# -----------------------------------------------------------
-
-def make_status_handler(client):
-    @owner_only
-    async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        try:
-            account = await client.get_account()
-            position = await client.get_position()
-            ob = await client.get_orderbook()
-
-            equity = float(account.get("equity", 0))
-            free_col = float(account.get("freeCollateral", 0))
-            price = ob.get("bid", "N/A")
-
-            pos_text = "_No open position_"
-            if position:
-                side = position.get("side", "?")
-                size = position.get("size", "?")
-                entry = float(position.get("entryPrice", 0))
-                upnl = float(position.get("unrealizedPnl", 0))
-                emoji = "🟢" if upnl >= 0 else "🔴"
-                pos_text = (
-                    f"{emoji} *{side}* `{size}` BTC\n"
-                    f"Entry: `${entry:,.2f}` | uPnL: `${upnl:+.2f}`"
-                )
-
-            msg = (
-                f"📊 *Bot Status — {datetime.utcnow().strftime('%H:%M:%S UTC')}*\n\n"
-                f"🌐 Network  : `{cfg.network}`\n"
-                f"📈 Symbol   : `{cfg.symbol}`\n"
-                f"⏱ TF       : `{cfg.candle_resolution}`\n"
-                f"⚙️ Leverage : `{cfg.leverage}x`\n"
-                f"💵 Size     : `${cfg.position_size_usdc} USDC`\n"
-                f"🛡 SL/TP   : `{cfg.stop_loss_pct*100:.1f}%` / `{cfg.take_profit_pct*100:.1f}%`\n"
-                f"⏸ Paused   : {_fmt_bool(cfg.paused)}\n"
-                f"🔁 Dry Run  : {_fmt_bool(cfg.dry_run)}\n\n"
-                f"💰 *Account*\n"
-                f"Equity    : `${equity:,.2f}`\n"
-                f"Free Col. : `${free_col:,.2f}`\n"
-                f"BTC Price : `${price:,.2f}`\n\n"
-                f"📍 *Position*\n{pos_text}"
-            )
-        except Exception as e:
-            msg = f"❌ Could not fetch status: `{e}`"
-
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-    return cmd_status
-
-
-def make_balance_handler(client):
-    @owner_only
-    async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        try:
-            account = await client.get_account()
-            equity = float(account.get("equity", 0))
-            free = float(account.get("freeCollateral", 0))
-            msg = (
-                f"💰 *Account Balance*\n\n"
-                f"Total Equity  : `${equity:,.2f} USDC`\n"
-                f"Free Collateral: `${free:,.2f} USDC`"
-            )
-        except Exception as e:
-            msg = f"❌ Error: `{e}`"
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-    return cmd_balance
-
-
-def make_position_handler(client):
-    @owner_only
-    async def cmd_position(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        try:
-            position = await client.get_position()
-            if position is None:
-                msg = "📍 *No open position.*"
-            else:
-                side = position.get("side", "?")
-                size = position.get("size", "?")
-                entry = float(position.get("entryPrice", 0))
-                upnl = float(position.get("unrealizedPnl", 0))
-                liq_price = position.get("liquidationPrice", "N/A")
-                emoji = "🟢" if upnl >= 0 else "🔴"
-                msg = (
-                    f"📍 *Open Position*\n\n"
-                    f"Side      : {emoji} `{side}`\n"
-                    f"Size      : `{size} BTC`\n"
-                    f"Entry     : `${entry:,.2f}`\n"
-                    f"uPnL      : `${upnl:+.2f} USDC`\n"
-                    f"Liq. Price: `${liq_price}`"
-                )
-        except Exception as e:
-            msg = f"❌ Error: `{e}`"
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-    return cmd_position
-
-
-def make_close_handler(client):
-    @owner_only
-    async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("⚡ Closing position...")
-        try:
-            result = await client.close_position()
-            if result is None:
-                msg = "ℹ️ No open position to close."
-            else:
-                dry = result.get("status") == "DRY_RUN"
-                msg = (
-                    "✅ Position closed (DRY RUN — no real order sent)."
-                    if dry else
-                    f"✅ Position closed.\nTX: `{result.get('tx_hash', 'N/A')}`"
-                )
-        except Exception as e:
-            msg = f"❌ Failed to close: `{e}`"
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-    return cmd_close
-
-
-# -----------------------------------------------------------
-# Bot Lifecycle
-# -----------------------------------------------------------
+# ── Startup & push alerts ─────────────────────────────────────
 
 async def start_telegram_bot(client) -> None:
-    """
-    Build and start the Telegram bot application.
-    Runs as a concurrent asyncio task — does NOT block.
-    """
+    global _client
+    _client = client
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        logger.warning(
-            "TELEGRAM_BOT_TOKEN not set — Telegram control disabled. "
-            "Set it in .env to enable."
-        )
+        logger.warning("TELEGRAM_BOT_TOKEN not set — Telegram UI disabled.")
         return
 
     app = Application.builder().token(token).build()
+    app.add_handler(build_conversation())
 
-    # Register static handlers
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("help",     cmd_help))
-    app.add_handler(CommandHandler("settings", cmd_settings))
-    app.add_handler(CommandHandler("set",      cmd_set))
-    app.add_handler(CommandHandler("pause",    cmd_pause))
-    app.add_handler(CommandHandler("resume",   cmd_resume))
-    app.add_handler(CommandHandler("dryrun",   cmd_dryrun))
-    app.add_handler(CommandHandler("network",  cmd_network))
-    app.add_handler(CommandHandler("logs",     cmd_logs))
-
-    # Register handlers that need the dYdX client
-    app.add_handler(CommandHandler("status",   make_status_handler(client)))
-    app.add_handler(CommandHandler("balance",  make_balance_handler(client)))
-    app.add_handler(CommandHandler("position", make_position_handler(client)))
-    app.add_handler(CommandHandler("close",    make_close_handler(client)))
-
-    # Set the command list visible in Telegram menu
     await app.bot.set_my_commands([
-        BotCommand("start",    "Welcome & quick status"),
-        BotCommand("status",   "Full bot status + position"),
-        BotCommand("balance",  "Account USDC balance"),
-        BotCommand("position", "Open position details"),
-        BotCommand("set",      "Change a setting: /set leverage 5"),
-        BotCommand("settings", "Show all settings"),
-        BotCommand("pause",    "Pause trading"),
-        BotCommand("resume",   "Resume trading"),
-        BotCommand("close",    "Force-close position now"),
-        BotCommand("dryrun",   "Toggle dry-run mode"),
-        BotCommand("network",  "Switch mainnet ↔ testnet"),
-        BotCommand("logs",     "Last 25 log lines"),
-        BotCommand("help",     "Show all commands"),
+        BotCommand("start", "Open the control dashboard"),
     ])
 
-    logger.info("✅ Telegram bot started. Send /start to your bot.")
+    logger.info("✅ Telegram button UI started. Send /start to your bot.")
 
-    # Start polling (non-blocking — uses the running event loop)
     await app.initialize()
     await app.start()
-    await app.updater.start_polling(allowed_updates=["message"])
+    await app.updater.start_polling(allowed_updates=["message", "callback_query"])
 
-    # Keep running until cancelled
     try:
         await asyncio.Event().wait()
     finally:
@@ -418,17 +522,13 @@ async def start_telegram_bot(client) -> None:
 
 
 async def send_alert(message: str) -> None:
-    """
-    Send a push notification to the owner's chat.
-    Call this from the trading loop for important events.
-    """
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    """Push a notification to the owner's chat from the trading loop."""
+    token   = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         return
     try:
-        from telegram import Bot
         bot = Bot(token)
-        await bot.send_message(chat_id=chat_id, text=message, parse_mode=ParseMode.MARKDOWN)
+        await bot.send_message(chat_id=chat_id, text=message, parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error(f"Telegram alert failed: {e}")
