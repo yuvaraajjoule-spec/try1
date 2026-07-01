@@ -1,0 +1,27 @@
+[Unit]
+Description=dYdX SMC BTC/USD Trading Bot
+Documentation=https://github.com/yourusername/cryptotrade
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace "ubuntu" with your Oracle VM username if different
+User=ubuntu
+WorkingDirectory=/home/ubuntu/cryptotrade
+ExecStart=/home/ubuntu/cryptotrade/venv/bin/python /home/ubuntu/cryptotrade/bot.py
+# Automatically restart on crash
+Restart=always
+RestartSec=30
+# Backoff cap: wait at most 5 minutes between restarts
+StartLimitIntervalSec=600
+StartLimitBurst=10
+# Capture logs via journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cryptotrade
+# Load .env secrets as environment variables
+EnvironmentFile=/home/ubuntu/cryptotrade/.env
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+# dYdX v4 Python client
+dydx-v4-client>=0.4.0
+
+# Data processing (SMC logic)
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Environment variable loading
+python-dotenv>=1.0.0
+
+# HTTP & async (used by dydx client internally)
+aiohttp>=3.9.0
+requests>=2.31.0
+
+# Logging utilities
+colorlog>=6.7.0
+
+# Scheduling
+schedule>=1.2.0
