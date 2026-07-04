@@ -1,5 +1,5 @@
-# dYdX v4 Python client
-dydx-v4-client>=0.4.0
+# dYdX v4 Python client (avoid 1.1.5post1 — compromised supply chain version)
+dydx-v4-client>=0.4.0,!=1.1.5.post1
 
 # Cosmos / crypto primitives (bundled with dydx-v4-client, listed for clarity)
 cosmpy>=0.9.0
