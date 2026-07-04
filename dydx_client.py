@@ -14,7 +14,10 @@ from dotenv import load_dotenv
 
 # dYdX v4 client imports
 from dydx_v4_client.node.client import NodeClient
-from dydx_v4_client.node.market import Market, MAX_CLIENT_ID
+from dydx_v4_client.node.market import Market
+
+# MAX_CLIENT_ID is not exported in dydx-v4-client==1.1.0 — define it directly
+MAX_CLIENT_ID = 2**32 - 1  # max 32-bit unsigned int, used as order client_id
 from dydx_v4_client.indexer.rest.indexer_client import IndexerClient as RestIndexerClient
 from dydx_v4_client.network import MAINNET, make_testnet
 from dydx_v4_client.wallet import Wallet
