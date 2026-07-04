@@ -4,6 +4,10 @@ Runs the SMC strategy on dYdX BTC-USD 24/7.
 All settings are read live from config.cfg so Telegram changes
 take effect on the next poll cycle without a restart.
 
+Deployment: Render.com (free tier)
+  - A Flask keep-alive server runs on PORT (default 8080) in a background thread.
+  - UptimeRobot pings /health every 10 minutes so Render never sleeps.
+
 Usage:
     python bot.py            # live trading
     python bot.py --dry-run  # simulate (no real orders)
@@ -14,8 +18,11 @@ import asyncio
 import json
 import logging
 import os
+import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+from flask import Flask, jsonify
 
 import colorlog
 from dotenv import load_dotenv
@@ -307,5 +314,55 @@ async def main():
         await client.close()
 
 
+# -----------------------------------------------------------
+# Keep-Alive Web Server (for Render + UptimeRobot)
+# -----------------------------------------------------------
+
+_flask_app = Flask(__name__)
+_start_time = None
+
+
+@_flask_app.route("/")
+def index():
+    return jsonify({
+        "status": "running",
+        "service": "dYdX SMC Trading Bot",
+        "message": "Bot is alive and trading. Visit /health for uptime info."
+    })
+
+
+@_flask_app.route("/health")
+def health():
+    import time
+    uptime_seconds = int(time.time() - _start_time) if _start_time else 0
+    hours, remainder = divmod(uptime_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return jsonify({
+        "status": "ok",
+        "uptime": f"{hours}h {minutes}m {seconds}s",
+        "service": "dYdX SMC Trading Bot",
+        "network": os.getenv("DYDX_NETWORK", "mainnet"),
+        "dry_run": os.getenv("DRY_RUN", "true"),
+    })
+
+
+def _run_flask():
+    """Run Flask in a daemon thread. Render needs an open HTTP port."""
+    port = int(os.getenv("PORT", 8080))
+    # Use werkzeug's simple server — no extra config needed on Render
+    _flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+
 if __name__ == "__main__":
+    import time
+    _start_time = time.time()
+
+    # Start the keep-alive Flask server in a background daemon thread
+    flask_thread = threading.Thread(target=_run_flask, daemon=True, name="keep-alive")
+    flask_thread.start()
+    logging.getLogger("bot").info(
+        f"Keep-alive server started on port {os.getenv('PORT', 8080)} "
+        "→ UptimeRobot should ping /health every 10 min"
+    )
+
     asyncio.run(main())

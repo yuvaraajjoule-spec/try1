@@ -1,0 +1,63 @@
+services:
+  - type: web
+    name: cryptotrade-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    plan: free
+
+    # Render injects PORT automatically — Flask reads it from env
+    # Do NOT set PORT here; Render manages it.
+
+    envVars:
+      # ── dYdX credentials ──────────────────────────────────────
+      - key: DYDX_PRIVATE_KEY
+        sync: false   # fill in Render dashboard → Environment
+
+      - key: DYDX_WALLET_ADDRESS
+        sync: false
+
+      - key: DYDX_NETWORK
+        value: mainnet   # change to "testnet" for safe testing
+
+      # ── Telegram ───────────────────────────────────────────────
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+
+      # ── Trading parameters ────────────────────────────────────
+      - key: TRADE_SYMBOL
+        value: BTC-USD
+
+      - key: CANDLE_RESOLUTION
+        value: 15MINS
+
+      - key: CANDLE_LIMIT
+        value: "100"
+
+      - key: POLL_INTERVAL_SECONDS
+        value: "60"
+
+      - key: POSITION_SIZE_USDC
+        value: "50"
+
+      - key: LEVERAGE
+        value: "1"
+
+      - key: STOP_LOSS_PCT
+        value: "0.015"
+
+      - key: TAKE_PROFIT_PCT
+        value: "0.03"
+
+      - key: MAX_DAILY_LOSS_USDC
+        value: "100"
+
+      # ── Safety: start in dry-run mode ─────────────────────────
+      - key: DRY_RUN
+        value: "true"   # ← change to "false" only when ready for live trading
+
+      - key: LOG_LEVEL
+        value: INFO

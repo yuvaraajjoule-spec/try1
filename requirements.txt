@@ -23,3 +23,6 @@ python-telegram-bot>=20.7
 
 # Scheduling (optional utility)
 schedule>=1.2.0
+
+# Keep-alive web server (for Render + UptimeRobot)
+flask>=3.0.0
