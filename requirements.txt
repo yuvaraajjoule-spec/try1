@@ -1,12 +1,8 @@
-# dYdX v4 Python client (avoid 1.1.5post1 — compromised supply chain version)
-dydx-v4-client>=0.4.0,!=1.1.5.post1
-
-# Protobuf — must match gencode version used by v4_proto (6.31.1)
-# Error from Render: "gencode 6.31.1 runtime 5.29.6" → bump to >=6.31.1
-protobuf>=6.31.1
-
-# Cosmos / crypto primitives (bundled with dydx-v4-client, listed for clarity)
-cosmpy>=0.9.0
+# dYdX v4 Python client — pinned to 1.1.0 (known good, avoids compromised 1.1.5.post1)
+dydx-v4-client==1.1.0
+# NOTE: protobuf and cosmpy are intentionally NOT pinned here.
+# cosmpy (pulled by dydx-v4-client) requires protobuf<6.0
+# Letting pip resolve the correct compatible versions automatically.
 
 # Data processing (SMC logic)
 pandas>=2.0.0
