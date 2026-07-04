@@ -1,6 +1,7 @@
 """
 risk.py — Risk Management Layer
 Handles position sizing, stop-loss/take-profit, and daily loss limits.
+Also exposes get_daily_pnl() for the Telegram dashboard.
 """
 
 import json
@@ -29,7 +30,12 @@ def _load_state() -> dict:
             return json.loads(STATE_FILE.read_text())
         except Exception:
             pass
-    return {"date": str(date.today()), "daily_loss_usdc": 0.0}
+    return {
+        "date": str(date.today()),
+        "daily_pnl_usdc": 0.0,   # net P&L (positive = profit, negative = loss)
+        "daily_loss_usdc": 0.0,  # cumulative loss only (for loss-limit guard)
+        "trade_count": 0,
+    }
 
 
 def _save_state(state: dict):
@@ -39,19 +45,41 @@ def _save_state(state: dict):
 def _get_daily_state() -> dict:
     state = _load_state()
     if state.get("date") != str(date.today()):
-        # New day — reset
-        state = {"date": str(date.today()), "daily_loss_usdc": 0.0}
+        # New day — reset all daily counters
+        state = {
+            "date": str(date.today()),
+            "daily_pnl_usdc": 0.0,
+            "daily_loss_usdc": 0.0,
+            "trade_count": 0,
+        }
         _save_state(state)
     return state
 
 
 def record_trade_pnl(pnl_usdc: float):
-    """Call this after a trade closes to track daily loss."""
+    """Call this after a trade closes to track daily net P&L and loss limit."""
     state = _get_daily_state()
+    state["daily_pnl_usdc"]  = round(state.get("daily_pnl_usdc", 0.0) + pnl_usdc, 4)
+    state["trade_count"]     = state.get("trade_count", 0) + 1
     if pnl_usdc < 0:
         state["daily_loss_usdc"] += abs(pnl_usdc)
-        _save_state(state)
-        logger.info(f"Daily loss updated: ${state['daily_loss_usdc']:.2f} USDC")
+    _save_state(state)
+    logger.info(
+        f"Trade #{state['trade_count']} closed | "
+        f"PnL: ${pnl_usdc:+.2f} | "
+        f"Day net: ${state['daily_pnl_usdc']:+.2f} USDC"
+    )
+
+
+def get_daily_pnl() -> dict:
+    """
+    Return today's trading summary.
+    Safe to call from anywhere (Telegram UI, dashboard, etc.).
+
+    Returns:
+        dict with keys: date, daily_pnl_usdc, daily_loss_usdc, trade_count
+    """
+    return _get_daily_state()
 
 
 # -----------------------------------------------------------

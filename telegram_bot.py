@@ -3,10 +3,11 @@ telegram_bot.py — Button-driven Telegram UI (no commands needed)
 Everything controlled via inline keyboard buttons on your phone.
 
 Screens:
-  🏠 Dashboard  →  live price, position, P&L, signal
+  🏠 Dashboard  →  live price, position, uPnL, TODAY'S P&L
   📊 Status     →  full account details
-  ⚙️ Settings   →  tap any setting to change it inline
+  ⚡️ Settings   →  tap any setting to change it inline
   🛡 Risk       →  pause, resume, dry run, close position
+  📅 P&L        →  today's realised P&L, trade count, loss cap usage
   📄 Logs       →  last 25 log lines
 """
 
@@ -36,6 +37,7 @@ from telegram.ext import (
 )
 
 from config import cfg
+from risk import get_daily_pnl
 
 logger = logging.getLogger(__name__)
 LOG_FILE = Path("logs/bot.log")
@@ -48,7 +50,8 @@ LOG_FILE = Path("logs/bot.log")
     RISK_MENU,
     LOGS_SCREEN,
     CONFIRM_CLOSE,
-) = range(6)
+    PNL_SCREEN,
+) = range(7)
 
 # Which setting key is being edited (stored in context.user_data)
 EDITING_KEY = "editing_key"
@@ -76,9 +79,9 @@ def _kb(*rows):
 def main_kb():
     return _kb(
         [("📊 Status", "status"), ("💰 Balance", "balance")],
-        [("📍 Position", "position"), ("📄 Logs", "logs")],
+        [("📍 Position", "position"), ("📅 Today's P&L", "pnl")],
         [("⚙️ Settings", "settings"), ("🛡 Risk", "risk")],
-        [("🔄 Refresh", "home")],
+        [("📄 Logs", "logs"), ("🔄 Refresh", "home")],
     )
 
 def settings_kb():
@@ -126,10 +129,24 @@ def logs_kb():
         [("🔄 Refresh Logs", "logs"), ("🏠 Home", "home")],
     )
 
+def pnl_kb():
+    return _kb(
+        [("🔄 Refresh", "pnl"), ("🏠 Home", "home")],
+    )
+
 # ── Text builders ─────────────────────────────────────────────
 
 def _bool_icon(v: bool) -> str:
     return "✅" if v else "❌"
+
+
+def _pnl_line() -> str:
+    """One-liner summary of today's P&L for embedding in other screens."""
+    d = get_daily_pnl()
+    net   = d.get("daily_pnl_usdc", 0.0)
+    emoji = "🟢" if net >= 0 else "🔴"
+    count = d.get("trade_count", 0)
+    return f"{emoji} Today's P&L: <code>${net:+.2f} USDC</code>  ({count} trade{'s' if count != 1 else ''} closed)"
 
 async def _dashboard_text(client=None) -> str:
     now = datetime.utcnow().strftime("%H:%M:%S UTC")
@@ -181,6 +198,8 @@ async def _dashboard_text(client=None) -> str:
         f"💰 Balance  : <code>{bal_str}</code>\n"
         f"₿  BTC Price: <code>{price_str}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{_pnl_line()}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{pos_str}"
     )
 
@@ -194,12 +213,24 @@ def _settings_text() -> str:
     )
 
 def _risk_text() -> str:
+    d     = get_daily_pnl()
+    net   = d.get("daily_pnl_usdc", 0.0)
+    loss  = d.get("daily_loss_usdc", 0.0)
+    cap   = float(cfg.max_daily_loss_usdc)
+    count = d.get("trade_count", 0)
+    used_pct = (loss / cap * 100) if cap > 0 else 0
+    net_emoji = "🟢" if net >= 0 else "🔴"
     return (
         "🛡 <b>Risk Controls</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Paused   : {_bool_icon(cfg.paused)}  {'Bot is NOT taking new trades.' if cfg.paused else 'Bot is trading.'}\n"
         f"Dry Run  : {_bool_icon(cfg.dry_run)}  {'No real orders sent.' if cfg.dry_run else 'LIVE orders active.'}\n"
-        f"Daily Loss Cap: <code>${cfg.max_daily_loss_usdc}</code>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{net_emoji} Today's Net P&L : <code>${net:+.2f} USDC</code>\n"
+        f"📉 Today's Losses : <code>${loss:.2f} USDC</code>\n"
+        f"🚧 Daily Loss Cap : <code>${cap:.0f} USDC</code>  ({used_pct:.0f}% used)\n"
+        f"📦 Trades Closed  : <code>{count}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
         "<b>⚠️ Force Close</b> will send a market order immediately."
     )
 
@@ -299,6 +330,42 @@ async def _logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _ok(update): return MAIN
     await _edit(update, _logs_text(), logs_kb())
     return MAIN
+
+
+async def _pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Dedicated Today's P&L screen."""
+    if not _ok(update): return MAIN
+    d     = get_daily_pnl()
+    net   = d.get("daily_pnl_usdc", 0.0)
+    loss  = d.get("daily_loss_usdc", 0.0)
+    wins  = d.get("trade_count", 0)   # total closed trades
+    cap   = float(cfg.max_daily_loss_usdc)
+    used_pct = (loss / cap * 100) if cap > 0 else 0
+    remaining = max(cap - loss, 0)
+    today = d.get("date", "today")
+
+    net_emoji = "🟢 PROFIT" if net > 0 else ("🔴 LOSS" if net < 0 else "⚪ BREAK-EVEN")
+
+    # Progress bar for daily loss cap  (10 blocks)
+    filled = min(int(used_pct / 10), 10)
+    bar = "🟥" * filled + "⬜" * (10 - filled)
+
+    text = (
+        f"📅 <b>Today's Trading Summary</b>\n"
+        f"<i>{today} (UTC)</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Net P&L   :</b>  <code>${net:+.2f} USDC</code>  {net_emoji}\n"
+        f"<b>Realised  :</b>  <code>{wins}</code> trade{'s' if wins != 1 else ''} closed\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Daily Loss Cap</b>\n"
+        f"{bar}  <code>{used_pct:.0f}%</code>\n"
+        f"Used      : <code>${loss:.2f}</code> of <code>${cap:.0f}</code>\n"
+        f"Remaining : <code>${remaining:.2f} USDC</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>Resets automatically at midnight UTC.</i>"
+    )
+    await _edit(update, text, pnl_kb())
+    return PNL_SCREEN
 
 # ── Setting input flow ────────────────────────────────────────
 
@@ -450,6 +517,7 @@ def build_conversation() -> ConversationHandler:
                 CallbackQueryHandler(_status,        pattern="^status$"),
                 CallbackQueryHandler(_balance,       pattern="^balance$"),
                 CallbackQueryHandler(_position,      pattern="^position$"),
+                CallbackQueryHandler(_pnl,           pattern="^pnl$"),
                 CallbackQueryHandler(_settings,      pattern="^settings$"),
                 CallbackQueryHandler(_risk,          pattern="^risk$"),
                 CallbackQueryHandler(_logs,          pattern="^logs$"),
@@ -478,6 +546,10 @@ def build_conversation() -> ConversationHandler:
             ],
             LOGS_SCREEN: [
                 CallbackQueryHandler(_logs, pattern="^logs$"),
+                CallbackQueryHandler(_home, pattern="^home$"),
+            ],
+            PNL_SCREEN: [
+                CallbackQueryHandler(_pnl,  pattern="^pnl$"),
                 CallbackQueryHandler(_home, pattern="^home$"),
             ],
         },
