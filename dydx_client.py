@@ -15,14 +15,15 @@ from typing import Optional
 import pandas as pd
 from dotenv import load_dotenv
 
-# dYdX v4 client imports — verified against 1.1.0 source
+# dYdX v4 client imports — verified against 1.1.0 PyPI release
 from dydx_v4_client import MAX_CLIENT_ID, OrderFlags
 from dydx_v4_client.node.client import NodeClient
 from dydx_v4_client.node.market import Market
 from dydx_v4_client.indexer.rest.indexer_client import IndexerClient as RestIndexerClient
 from dydx_v4_client.network import make_mainnet, make_testnet
 from dydx_v4_client.wallet import Wallet
-from dydx_v4_client.key_pair import KeyPair
+# NOTE: key_pair module doesn't exist in PyPI 1.1.0 — private key auth
+# uses coincurve directly (see _auth_private_key method)
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -124,37 +125,84 @@ class DydxClient:
     async def _auth_private_key(self):
         """
         Authenticate using a raw private key (hex string).
-        Uses the dydx_v4_client KeyPair which wraps secp256k1.
+        Tries dydx_v4_client.key_pair.KeyPair first (newer versions),
+        falls back to coincurve (always installed as a dependency).
         """
+        # Strip 0x prefix if present
+        pk_hex = self._private_key.lstrip("0x")
+        pk_bytes = bytes.fromhex(pk_hex)
+
+        # Try to get KeyPair from dydx_v4_client (newer versions have it)
+        key_obj = None
         try:
-            # Strip 0x prefix if present
-            pk_hex = self._private_key.lstrip("0x")
-            key_pair = KeyPair.from_hex(pk_hex)
+            from dydx_v4_client.key_pair import KeyPair
+            key_obj = KeyPair.from_hex(pk_hex)
+            logger.debug("Using dydx_v4_client.key_pair.KeyPair")
+        except (ImportError, AttributeError):
+            pass
 
-            # Derive address from the key pair
-            temp_wallet = Wallet(
-                key=key_pair,
-                account_number=0,
-                sequence=0,
-            )
-            derived_address = temp_wallet.address
+        # Fallback: build a shim using coincurve (installed as dydx dependency)
+        if key_obj is None:
+            try:
+                import hashlib
+                import bech32
+                from coincurve import PrivateKey as CCPrivateKey
+                from Crypto.Hash import RIPEMD160
 
-            # Use provided address or derived one
-            address = self._wallet_address or derived_address
+                cc_key = CCPrivateKey(pk_bytes)
+                pub_bytes = cc_key.public_key.format(compressed=True)
 
-            # Now get actual account info from chain
+                class _KeyShim:
+                    """Minimal shim matching the Wallet.key interface."""
+                    def __init__(self, priv, pub):
+                        self._priv = priv
+                        self.public_key_bytes = pub
+
+                    def sign(self, message: bytes) -> bytes:
+                        return CCPrivateKey(self._priv).sign(message)
+
+                key_obj = _KeyShim(pk_bytes, pub_bytes)
+
+                # Derive dydx1... address from public key
+                sha = hashlib.sha256(pub_bytes).digest()
+                ripe = RIPEMD160.new(sha).digest()
+                derived_address = bech32.bech32_encode(
+                    "dydx", bech32.convertbits(ripe, 8, 5)
+                )
+                logger.debug(f"Using coincurve shim. Derived: {derived_address}")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Private key auth failed — could not load key_pair or coincurve: {e}\n"
+                    f"Consider using DYDX_MNEMONIC instead."
+                ) from e
+
+        # Use user-provided address, or the one we derived
+        address = self._wallet_address
+        if not address:
+            # If we derived it above (coincurve path), use that
+            if 'derived_address' in dir():
+                address = derived_address
+            else:
+                # KeyPair path — derive from a temp wallet
+                temp = Wallet(key=key_obj, account_number=0, sequence=0)
+                address = temp.address
+
+        # Get actual account info from chain
+        try:
             account = await self.node.get_account(address)
             wallet = Wallet(
-                key=key_pair,
+                key=key_obj,
                 account_number=account.account_number,
                 sequence=account.sequence,
             )
-
-            logger.info(f"🔑 Authenticated via private key. Address: {address}")
-            return wallet, address
-
         except Exception as e:
-            raise RuntimeError(f"Private key authentication failed: {e}") from e
+            raise RuntimeError(
+                f"Failed to get account info for {address}: {e}\n"
+                f"Make sure DYDX_WALLET_ADDRESS is correct and the account exists on {self.network_name}."
+            ) from e
+
+        logger.info(f"🔑 Authenticated via private key. Address: {address}")
+        return wallet, address
 
     async def reconnect(self):
         """Reconnect — useful after a network switch via Telegram."""
