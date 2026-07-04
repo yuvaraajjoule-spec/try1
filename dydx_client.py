@@ -1,7 +1,10 @@
 """
 dydx_client.py — dYdX v4 API Wrapper
-Handles authentication via private key + wallet address,
+Handles authentication via mnemonic or private key,
 market data fetching, and order placement.
+
+Verified against dydx-v4-client==1.1.0 source at:
+https://github.com/dydxprotocol/v4-clients/tree/main/v4-client-py-v2
 """
 
 import asyncio
@@ -12,15 +15,14 @@ from typing import Optional
 import pandas as pd
 from dotenv import load_dotenv
 
-# dYdX v4 client imports
+# dYdX v4 client imports — verified against 1.1.0 source
+from dydx_v4_client import MAX_CLIENT_ID, OrderFlags
 from dydx_v4_client.node.client import NodeClient
 from dydx_v4_client.node.market import Market
-
-# MAX_CLIENT_ID is not exported in dydx-v4-client==1.1.0 — define it directly
-MAX_CLIENT_ID = 2**32 - 1  # max 32-bit unsigned int, used as order client_id
 from dydx_v4_client.indexer.rest.indexer_client import IndexerClient as RestIndexerClient
-from dydx_v4_client.network import MAINNET, make_testnet
+from dydx_v4_client.network import make_mainnet, make_testnet
 from dydx_v4_client.wallet import Wallet
+from dydx_v4_client.key_pair import KeyPair
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -28,9 +30,19 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------
 # Network config
 # -----------------------------------------------------------
+# make_mainnet() is a partial that needs node_url, rest_indexer, websocket_indexer
+# make_testnet() is pre-configured with defaults → call it to get a Network
+
+MAINNET = make_mainnet(
+    node_url="dydx-grpc.kingnodes.com",
+    rest_indexer="https://indexer.dydx.trade",
+    websocket_indexer="wss://indexer.dydx.trade/v4/ws",
+)
+TESTNET = make_testnet()
+
 NETWORKS = {
     "mainnet": MAINNET,
-    "testnet": make_testnet(),
+    "testnet": TESTNET,
 }
 
 
@@ -99,42 +111,48 @@ class DydxClient:
 
         # --- Auth: private key preferred, mnemonic fallback ---
         if self._private_key:
-            self.wallet, self.address = await self._auth_private_key(network)
+            self.wallet, self.address = await self._auth_private_key()
         else:
-            self.wallet = await Wallet.from_mnemonic(self.node, self._mnemonic)
+            # Wallet.from_mnemonic requires (node, mnemonic, address)
+            self.wallet = await Wallet.from_mnemonic(
+                self.node, self._mnemonic, self._wallet_address
+            )
             self.address = self.wallet.address
 
         logger.info(f"✅ Connected | Network: {self.network_name} | Address: {self.address}")
 
-    async def _auth_private_key(self, network):
+    async def _auth_private_key(self):
         """
-        Authenticate using a raw secp256k1 private key (hex string).
-        Uses cosmpy under the hood (bundled with dydx-v4-client).
+        Authenticate using a raw private key (hex string).
+        Uses the dydx_v4_client KeyPair which wraps secp256k1.
         """
         try:
-            from cosmpy.crypto.keypairs import Secp256k1
-            from dydx_v4_client.wallet import Wallet as V4Wallet
-
             # Strip 0x prefix if present
             pk_hex = self._private_key.lstrip("0x")
-            keypair = Secp256k1(bytes.fromhex(pk_hex))
+            key_pair = KeyPair.from_hex(pk_hex)
 
-            # Build wallet from keypair
-            wallet = await V4Wallet.from_key(self.node, keypair)
+            # Derive address from the key pair
+            temp_wallet = Wallet(
+                key=key_pair,
+                account_number=0,
+                sequence=0,
+            )
+            derived_address = temp_wallet.address
 
-            # Use provided address or derive from wallet
-            address = self._wallet_address or wallet.address
-            wallet.address = address  # override if user provided one
+            # Use provided address or derived one
+            address = self._wallet_address or derived_address
+
+            # Now get actual account info from chain
+            account = await self.node.get_account(address)
+            wallet = Wallet(
+                key=key_pair,
+                account_number=account.account_number,
+                sequence=account.sequence,
+            )
 
             logger.info(f"🔑 Authenticated via private key. Address: {address}")
             return wallet, address
 
-        except ImportError:
-            raise ImportError(
-                "cosmpy is required for private key auth. "
-                "It should be bundled with dydx-v4-client. "
-                "Try: pip install dydx-v4-client --upgrade"
-            )
         except Exception as e:
             raise RuntimeError(f"Private key authentication failed: {e}") from e
 
@@ -146,8 +164,6 @@ class DydxClient:
 
     async def close(self):
         """Close all connections gracefully."""
-        if self.node:
-            await self.node.close()
         self.node = None
         self.indexer = None
         logger.info("Connections closed.")
@@ -267,24 +283,28 @@ class DydxClient:
             address=self.address,
             subaccount_number=0,
             client_id=MAX_CLIENT_ID,
-            order_flags=market.order_flags_short_term(),
+            order_flags=OrderFlags.SHORT_TERM,
         )
 
         current_block  = await self.node.latest_block_height()
         good_til_block = current_block + 10  # valid for ~10 blocks (~1 min)
 
-        order = market.order(
+        # Map string side to protobuf enum
+        from v4_proto.dydxprotocol.clob.order_pb2 import Order
+        order_side = Order.SIDE_BUY if side == "BUY" else Order.SIDE_SELL
+
+        order_obj = market.order(
             order_id=order_id,
             order_type="MARKET",
-            side=side,
+            side=order_side,
             size=size,
             price=0,           # market order — price ignored
-            time_in_force="GTT",
+            time_in_force=Order.TIME_IN_FORCE_IOC,
             good_til_block=good_til_block,
             reduce_only=reduce_only,
         )
 
-        tx_hash = await self.node.place_order(self.wallet, order)
+        tx_hash = await self.node.place_order(self.wallet, order_obj)
         logger.info(f"✅ Order placed | TX: {tx_hash}")
         return {"tx_hash": tx_hash, "side": side, "size": size}
 
