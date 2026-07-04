@@ -1,6 +1,10 @@
 # dYdX v4 Python client (avoid 1.1.5post1 — compromised supply chain version)
 dydx-v4-client>=0.4.0,!=1.1.5.post1
 
+# Protobuf — must be >=5.26.1 to match the gencode version in v4-proto
+# Without this pin, Render installs an older runtime that crashes on import
+protobuf>=5.26.1
+
 # Cosmos / crypto primitives (bundled with dydx-v4-client, listed for clarity)
 cosmpy>=0.9.0
 
