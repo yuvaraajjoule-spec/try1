@@ -35,6 +35,13 @@ _DEFAULTS = {
     "dry_run":              os.getenv("DRY_RUN", "false").lower() == "true",
     "paused":               False,   # set by Telegram /pause
     "log_level":            os.getenv("LOG_LEVEL", "INFO"),
+    # SMC Strategy Parameters
+    "min_bos_count":        int(os.getenv("MIN_BOS_COUNT", 2)),           # min BOS events before CHOCH triggers signal
+    "swing_length":         int(os.getenv("SWING_LENGTH", 5)),            # bars lookback for swing detection
+    "supertrend_atr_period": int(os.getenv("SUPERTREND_ATR_PERIOD", 10)), # ATR period for SuperTrend
+    "supertrend_multiplier": float(os.getenv("SUPERTREND_MULTIPLIER", 3.0)), # ATR multiplier for SuperTrend
+    # Dry-run simulation
+    "dry_run_equity":       float(os.getenv("DRY_RUN_EQUITY", 1000.0)),   # simulated starting equity for dry-run
 }
 
 # Valid choices for constrained fields
@@ -120,6 +127,16 @@ class _Config:
             raise ValueError("Stop loss must be between 0.1% and 50%")
         if key == "take_profit_pct" and not (0.001 <= float(value) <= 1.0):
             raise ValueError("Take profit must be between 0.1% and 100%")
+        if key == "min_bos_count" and not (1 <= int(value) <= 10):
+            raise ValueError("Min BOS count must be between 1 and 10")
+        if key == "swing_length" and not (2 <= int(value) <= 50):
+            raise ValueError("Swing length must be between 2 and 50")
+        if key == "supertrend_atr_period" and not (1 <= int(value) <= 50):
+            raise ValueError("SuperTrend ATR period must be between 1 and 50")
+        if key == "supertrend_multiplier" and not (0.5 <= float(value) <= 10.0):
+            raise ValueError("SuperTrend multiplier must be between 0.5 and 10.0")
+        if key == "dry_run_equity" and not (10.0 <= float(value) <= 1000000.0):
+            raise ValueError("Dry-run equity must be between $10 and $1,000,000")
 
         self._data[key] = value
         self.save()

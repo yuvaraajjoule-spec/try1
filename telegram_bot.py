@@ -37,7 +37,7 @@ from telegram.ext import (
 )
 
 from config import cfg
-from risk import get_daily_pnl
+from risk import get_daily_pnl, get_dry_run_stats
 
 logger = logging.getLogger(__name__)
 LOG_FILE = Path("logs/bot.log")
@@ -86,20 +86,22 @@ def main_kb():
 
 def settings_kb():
     lev  = cfg.leverage
-    size = cfg.position_size_usdc
     sl   = f"{cfg.stop_loss_pct*100:.1f}%"
-    tp   = f"{cfg.take_profit_pct*100:.1f}%"
     tf   = cfg.candle_resolution
     net  = cfg.network.upper()
     return _kb(
         [("📐 Leverage", "set_leverage"),      (f"Now: {lev}x",                    "noop")],
         [("💵 Position Size", "set_size"),      (f"Now: {cfg.position_size_pct*100:.0f}% of equity", "noop")],
         [("🛡 Stop Loss", "set_sl"),            (f"Now: {sl}",            "noop")],
-        [("🎯 Take Profit", "set_tp"),          (f"Now: {tp}",            "noop")],
         [("⏱ Timeframe", "set_tf"),            (f"Now: {tf}",            "noop")],
         [("📊 Candle Limit", "set_limit"),      (f"Now: {cfg.candle_limit}", "noop")],
         [("⏰ Poll Interval", "set_interval"),  (f"Now: {cfg.poll_interval}s", "noop")],
         [("💸 Max Daily Loss", "set_maxloss"),  (f"Now: ${cfg.max_daily_loss_usdc}", "noop")],
+        [("── SMC Strategy ──", "noop")],
+        [("🔢 Min BOS Count", "set_bos"),       (f"Now: {cfg.min_bos_count}", "noop")],
+        [("📏 Swing Length", "set_swing"),       (f"Now: {cfg.swing_length}", "noop")],
+        [("📈 ST ATR Period", "set_statr"),      (f"Now: {cfg.supertrend_atr_period}", "noop")],
+        [("📉 ST Multiplier", "set_stmult"),     (f"Now: {cfg.supertrend_multiplier}", "noop")],
         [("🌐 Network: " + net, "toggle_network")],
         [("🏠 Back", "home")],
     )
@@ -144,9 +146,10 @@ def _pnl_line() -> str:
     """One-liner summary of today's P&L for embedding in other screens."""
     d = get_daily_pnl()
     net   = d.get("daily_pnl_usdc", 0.0)
+    pct   = d.get("daily_pnl_pct", 0.0)
     emoji = "🟢" if net >= 0 else "🔴"
     count = d.get("trade_count", 0)
-    return f"{emoji} Today's P&L: <code>${net:+.2f} USDC</code>  ({count} trade{'s' if count != 1 else ''} closed)"
+    return f"{emoji} Today's P&L: <code>${net:+.2f} ({pct:+.2f}%)</code>  ({count} trade{'s' if count != 1 else ''} closed)"
 
 async def _dashboard_text(client=None) -> str:
     now = datetime.utcnow().strftime("%H:%M:%S UTC")
@@ -193,7 +196,9 @@ async def _dashboard_text(client=None) -> str:
         f"⏱ Timeframe: <code>{cfg.candle_resolution}</code>\n"
         f"📐 Leverage : <code>{cfg.leverage}x</code>  |  💵 <code>{cfg.position_size_pct*100:.0f}% of equity</code>\n"
         f"🛡 SL: <code>{cfg.stop_loss_pct*100:.1f}%</code>  |  "
-        f"🎯 TP: <code>{cfg.take_profit_pct*100:.1f}%</code>\n"
+        f"📤 Exit: <code>CHOCH-based</code>\n"
+        f"🔢 BOS: <code>{cfg.min_bos_count}</code>  |  "
+        f"📈 ST: <code>{cfg.supertrend_atr_period}/{cfg.supertrend_multiplier}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 Balance  : <code>{bal_str}</code>\n"
         f"₿  BTC Price: <code>{price_str}</code>\n"
@@ -333,10 +338,11 @@ async def _logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Dedicated Today's P&L screen."""
+    """Dedicated Today's P&L screen with percentage and dry-run stats."""
     if not _ok(update): return MAIN
     d     = get_daily_pnl()
     net   = d.get("daily_pnl_usdc", 0.0)
+    net_pct = d.get("daily_pnl_pct", 0.0)
     loss  = d.get("daily_loss_usdc", 0.0)
     wins  = d.get("trade_count", 0)   # total closed trades
     cap   = float(cfg.max_daily_loss_usdc)
@@ -354,13 +360,41 @@ async def _pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"📅 <b>Today's Trading Summary</b>\n"
         f"<i>{today} (UTC)</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Net P&L   :</b>  <code>${net:+.2f} USDC</code>  {net_emoji}\n"
+        f"<b>Net P&L   :</b>  <code>${net:+.2f} ({net_pct:+.2f}%)</code>  {net_emoji}\n"
         f"<b>Realised  :</b>  <code>{wins}</code> trade{'s' if wins != 1 else ''} closed\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Daily Loss Cap</b>\n"
         f"{bar}  <code>{used_pct:.0f}%</code>\n"
         f"Used      : <code>${loss:.2f}</code> of <code>${cap:.0f}</code>\n"
         f"Remaining : <code>${remaining:.2f} USDC</code>\n"
+    )
+
+    # Dry-run section
+    if cfg.dry_run:
+        dr = get_dry_run_stats()
+        dr_eq = dr.get("equity", 0.0)
+        dr_start = dr.get("starting_equity", 0.0)
+        dr_pnl = dr.get("daily_pnl_usdc", 0.0)
+        dr_pnl_pct = dr.get("daily_pnl_pct", 0.0)
+        dr_trades = dr.get("trade_count", 0)
+        dr_wins = dr.get("win_count", 0)
+        dr_wr = dr.get("win_rate", 0.0)
+        dr_open = dr.get("open_trade")
+        total_change = dr_eq - dr_start if dr_start > 0 else 0
+        total_pct = (total_change / dr_start * 100) if dr_start > 0 else 0
+
+        text += (
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔵 <b>Dry-Run Simulation</b>\n"
+            f"Start Equity : <code>${dr_start:,.2f}</code>\n"
+            f"Current      : <code>${dr_eq:,.2f} ({total_pct:+.2f}%)</code>\n"
+            f"Today's P&L  : <code>${dr_pnl:+.2f} ({dr_pnl_pct:+.2f}%)</code>\n"
+            f"Trades       : <code>{dr_trades}</code> (W: {dr_wins} | WR: {dr_wr:.0f}%)\n"
+        )
+        if dr_open:
+            text += f"Open Trade   : <code>{dr_open['side']} @ ${dr_open['entry']:,.2f}</code>\n"
+
+    text += (
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<i>Resets automatically at midnight UTC.</i>"
     )
@@ -372,12 +406,15 @@ async def _pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 _SET_PROMPTS = {
     "set_leverage":  ("set_leverage",  "leverage",             "📐 Enter new leverage (1–20):\nExample: <code>5</code>"),
     "set_size":      ("set_size",      "position_size_pct",    "💵 Enter position size as % of equity:\nExample: <code>10</code> for 10%  (min 1%, max 100%)"),
-    "set_sl":        ("set_sl",        "stop_loss_pct",        "🛡 Enter stop loss %:\nExample: <code>1.5</code> for 1.5%"),
-    "set_tp":        ("set_tp",        "take_profit_pct",      "🎯 Enter take profit %:\nExample: <code>3.0</code> for 3.0%"),
+    "set_sl":        ("set_sl",        "stop_loss_pct",        "🛡 Enter stop loss % (emergency SL):\nExample: <code>1.5</code> for 1.5%"),
     "set_tf":        ("set_tf",        "candle_resolution",    "⏱ Enter timeframe:\n<code>1MIN  5MINS  15MINS  30MINS  1HOUR  4HOURS  1DAY</code>"),
     "set_limit":     ("set_limit",     "candle_limit",         "📊 Enter candle limit:\nExample: <code>100</code>"),
     "set_interval":  ("set_interval",  "poll_interval",        "⏰ Enter poll interval in seconds:\nExample: <code>60</code>"),
     "set_maxloss":   ("set_maxloss",   "max_daily_loss_usdc",  "💸 Enter max daily loss (USDC):\nExample: <code>100</code>"),
+    "set_bos":       ("set_bos",       "min_bos_count",        "🔢 Min BOS before CHOCH triggers signal (1–10):\nExample: <code>2</code>"),
+    "set_swing":     ("set_swing",     "swing_length",         "📏 Swing detection lookback bars (2–50):\nExample: <code>5</code>"),
+    "set_statr":     ("set_statr",     "supertrend_atr_period", "📈 SuperTrend ATR period (1–50):\nExample: <code>10</code>"),
+    "set_stmult":    ("set_stmult",    "supertrend_multiplier", "📉 SuperTrend ATR multiplier (0.5–10):\nExample: <code>3.0</code>"),
 }
 
 async def _start_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
