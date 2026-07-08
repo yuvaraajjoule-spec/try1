@@ -38,7 +38,7 @@ _DEFAULTS = {
 }
 
 # Valid choices for constrained fields
-VALID_RESOLUTIONS = ["1MIN", "5MINS", "15MINS", "30MINS", "1HOUR", "4HOURS", "1DAY"]
+VALID_RESOLUTIONS = ["1MIN", "5MINS", "15MINS", "30MINS", "1HOUR", "4HOURS", "1DAY"]  # Note: 1MIN (no S) — dYdX API rejects '1MINS'
 VALID_NETWORKS    = ["mainnet", "testnet"]
 
 

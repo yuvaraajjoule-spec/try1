@@ -583,10 +583,28 @@ async def start_telegram_bot(client) -> None:
 
     await app.initialize()
     await app.start()
-    await app.updater.start_polling(allowed_updates=["message", "callback_query"])
+
+    # drop_pending_updates=True kicks any existing getUpdates session off
+    # Telegram's servers before this instance starts polling.  This prevents
+    # the "Conflict: terminated by other getUpdates request" error when Render
+    # restarts a service or you accidentally start a second local instance.
+    await app.updater.start_polling(
+        allowed_updates=["message", "callback_query"],
+        drop_pending_updates=True,
+    )
+
+    logger.info("Telegram polling started (stale sessions dropped).")
 
     try:
         await asyncio.Event().wait()
+    except Exception as e:
+        from telegram.error import Conflict
+        if isinstance(e, Conflict):
+            logger.critical(
+                "Telegram Conflict error: another bot instance is already running. "
+                "Kill all other instances before starting this one."
+            )
+        raise
     finally:
         await app.updater.stop()
         await app.stop()
