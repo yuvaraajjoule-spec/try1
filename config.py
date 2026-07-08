@@ -27,7 +27,7 @@ _DEFAULTS = {
     "candle_resolution":    os.getenv("CANDLE_RESOLUTION", "1MIN"),
     "candle_limit":         int(os.getenv("CANDLE_LIMIT", 100)),
     "poll_interval":        int(os.getenv("POLL_INTERVAL_SECONDS", 60)),
-    "position_size_usdc":   float(os.getenv("POSITION_SIZE_USDC", 50)),
+    "position_size_pct":    float(os.getenv("POSITION_SIZE_PCT", 0.10)),  # fraction of equity, e.g. 0.10 = 10%
     "leverage":             float(os.getenv("LEVERAGE", 1)),
     "stop_loss_pct":        float(os.getenv("STOP_LOSS_PCT", 0.015)),
     "take_profit_pct":      float(os.getenv("TAKE_PROFIT_PCT", 0.03)),
@@ -114,8 +114,8 @@ class _Config:
             raise ValueError(f"Resolution must be one of: {VALID_RESOLUTIONS}")
         if key == "leverage" and not (1 <= float(value) <= 20):
             raise ValueError("Leverage must be between 1 and 20")
-        if key == "position_size_usdc" and float(value) < 1:
-            raise ValueError("Position size must be at least $1 USDC")
+        if key == "position_size_pct" and not (0.01 <= float(value) <= 1.0):
+            raise ValueError("Position size must be between 1% and 100% of equity")
         if key == "stop_loss_pct" and not (0.001 <= float(value) <= 0.5):
             raise ValueError("Stop loss must be between 0.1% and 50%")
         if key == "take_profit_pct" and not (0.001 <= float(value) <= 1.0):

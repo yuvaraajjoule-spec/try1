@@ -92,8 +92,8 @@ def settings_kb():
     tf   = cfg.candle_resolution
     net  = cfg.network.upper()
     return _kb(
-        [("📐 Leverage", "set_leverage"),      (f"Now: {lev}x",          "noop")],
-        [("💵 Size (USDC)", "set_size"),        (f"Now: ${size}",         "noop")],
+        [("📐 Leverage", "set_leverage"),      (f"Now: {lev}x",                    "noop")],
+        [("💵 Position Size", "set_size"),      (f"Now: {cfg.position_size_pct*100:.0f}% of equity", "noop")],
         [("🛡 Stop Loss", "set_sl"),            (f"Now: {sl}",            "noop")],
         [("🎯 Take Profit", "set_tp"),          (f"Now: {tp}",            "noop")],
         [("⏱ Timeframe", "set_tf"),            (f"Now: {tf}",            "noop")],
@@ -191,7 +191,7 @@ async def _dashboard_text(client=None) -> str:
         f"🌐 Network  : <code>{cfg.network.upper()}</code>\n"
         f"📈 Market   : <code>{cfg.symbol}</code>\n"
         f"⏱ Timeframe: <code>{cfg.candle_resolution}</code>\n"
-        f"📐 Leverage : <code>{cfg.leverage}x</code>  |  💵 <code>${cfg.position_size_usdc}</code>\n"
+        f"📐 Leverage : <code>{cfg.leverage}x</code>  |  💵 <code>{cfg.position_size_pct*100:.0f}% of equity</code>\n"
         f"🛡 SL: <code>{cfg.stop_loss_pct*100:.1f}%</code>  |  "
         f"🎯 TP: <code>{cfg.take_profit_pct*100:.1f}%</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -371,7 +371,7 @@ async def _pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 _SET_PROMPTS = {
     "set_leverage":  ("set_leverage",  "leverage",             "📐 Enter new leverage (1–20):\nExample: <code>5</code>"),
-    "set_size":      ("set_size",      "position_size_usdc",   "💵 Enter position size in USDC:\nExample: <code>100</code>"),
+    "set_size":      ("set_size",      "position_size_pct",    "💵 Enter position size as % of equity:\nExample: <code>10</code> for 10%  (min 1%, max 100%)"),
     "set_sl":        ("set_sl",        "stop_loss_pct",        "🛡 Enter stop loss %:\nExample: <code>1.5</code> for 1.5%"),
     "set_tp":        ("set_tp",        "take_profit_pct",      "🎯 Enter take profit %:\nExample: <code>3.0</code> for 3.0%"),
     "set_tf":        ("set_tf",        "candle_resolution",    "⏱ Enter timeframe:\n<code>1MIN  5MINS  15MINS  30MINS  1HOUR  4HOURS  1DAY</code>"),
@@ -415,9 +415,10 @@ async def _receive_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Session lost. Go back to settings.", reply_markup=back_kb())
         return MAIN
 
-    # For pct fields user types e.g. "1.5" meaning 1.5% → store as 0.015
+    # For pct fields user types e.g. "10" meaning 10% → store as 0.10
+    # Also handle "1.5" → 0.015 etc.
     try:
-        if cfg_key in ("stop_loss_pct", "take_profit_pct"):
+        if cfg_key in ("stop_loss_pct", "take_profit_pct", "position_size_pct"):
             numeric = float(raw)
             if numeric > 1.0:
                 numeric = numeric / 100.0

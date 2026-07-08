@@ -86,32 +86,44 @@ def get_daily_pnl() -> dict:
 # Position Sizing
 # -----------------------------------------------------------
 
-def calculate_position_size(btc_price: float) -> float:
+def calculate_position_size(btc_price: float, equity_usdc: float) -> float:
     """
-    Convert USDC collateral + leverage → BTC contract size.
+    Convert equity fraction + leverage → BTC contract size.
 
     Formula:
-        size_btc = (POSITION_SIZE_USDC * LEVERAGE) / btc_price
+        collateral_usdc = equity_usdc × POSITION_SIZE_PCT
+        size_btc        = (collateral_usdc × LEVERAGE) / btc_price
 
-    dYdX BTC-USD contract is denominated in BTC (step size = 0.0001 BTC).
-    Reads from cfg singleton so Telegram-changed values are respected live.
+    Leverage scales the contract size (how many BTC you control),
+    but has NO effect on the SL/TP price levels — those are purely
+    entry_price ± percentage, computed in calculate_sl_tp().
+
+    dYdX BTC-USD contract step size = 0.0001 BTC.
+    Reads from cfg singleton so Telegram-changed values apply live.
     """
     from config import cfg  # late import to avoid circular dependency
-    usdc = float(cfg.position_size_usdc)
+    pct      = float(cfg.position_size_pct)   # e.g. 0.10 for 10%
     leverage = float(cfg.leverage)
     min_step = 0.0001
 
-    size_btc = (usdc * leverage) / btc_price
+    collateral_usdc = equity_usdc * pct
+    size_btc = (collateral_usdc * leverage) / btc_price
     # Round down to nearest step size
     size_btc = round(size_btc - (size_btc % min_step), 4)
 
     if size_btc < min_step:
         raise ValueError(
             f"Calculated size {size_btc} BTC is below minimum {min_step}. "
-            f"Increase POSITION_SIZE_USDC (currently {usdc}) or LEVERAGE."
+            f"Equity: ${equity_usdc:.2f} | Pct: {pct*100:.0f}% | "
+            f"Leverage: {leverage}x | BTC price: ${btc_price:.2f}. "
+            f"Increase POSITION_SIZE_PCT or LEVERAGE."
         )
 
-    logger.debug(f"Position size: {size_btc} BTC (${usdc} USDC × {leverage}x @ ${btc_price:.2f})")
+    logger.debug(
+        f"Position size: {size_btc} BTC "
+        f"(equity ${equity_usdc:.2f} × {pct*100:.0f}% = ${collateral_usdc:.2f} collateral "
+        f"× {leverage}x lev @ ${btc_price:.2f})"
+    )
     return size_btc
 
 
@@ -138,8 +150,9 @@ def calculate_sl_tp(
     Returns:
         (stop_loss_price, take_profit_price)
     """
-    sl_pct = float(os.getenv("STOP_LOSS_PCT", 0.015))
-    tp_pct = float(os.getenv("TAKE_PROFIT_PCT", 0.03))
+    from config import cfg  # late import to avoid circular dependency
+    sl_pct = float(cfg.stop_loss_pct)
+    tp_pct = float(cfg.take_profit_pct)
 
     # Try swing-based SL/TP
     if df is not None and "swing_high" in df.columns and "swing_low" in df.columns:
@@ -183,7 +196,8 @@ def calculate_sl_tp(
 
 def is_daily_loss_limit_hit() -> bool:
     """Returns True if today's loss has exceeded MAX_DAILY_LOSS_USDC."""
-    max_loss = float(os.getenv("MAX_DAILY_LOSS_USDC", 100))
+    from config import cfg  # late import to avoid circular dependency
+    max_loss = float(cfg.max_daily_loss_usdc)
     state = _get_daily_state()
     loss = state.get("daily_loss_usdc", 0.0)
 

@@ -149,7 +149,7 @@ async def trading_loop(client: DydxClient):
             label = {1: "BUY 🟢", -1: "SELL 🔴", 0: "HOLD ⚪"}[signal]
             logger.info(
                 f"Price: ${latest_close:,.2f} | Signal: {label} | "
-                f"Leverage: {cfg.leverage}x | Size: ${cfg.position_size_usdc}"
+                f"Leverage: {cfg.leverage}x | Size: {cfg.position_size_pct*100:.0f}% of equity"
             )
 
             # Alert on signal change
@@ -184,8 +184,19 @@ async def trading_loop(client: DydxClient):
                     await asyncio.sleep(2)
 
             # ── 5. Place order ────────────────────────────────
-            size_btc   = calculate_position_size(latest_close)
+            # Fetch live equity so position size scales with the account
+            try:
+                acc         = await client.get_account()
+                equity_usdc = float(acc.get("equity", 0))
+                if equity_usdc <= 0:
+                    raise ValueError("Account equity is zero or unavailable.")
+            except Exception as e:
+                logger.error(f"Could not fetch equity for position sizing: {e} — skipping cycle.")
+                await asyncio.sleep(cfg.poll_interval)
+                continue
+
             order_side = "BUY" if signal == 1 else "SELL"
+            size_btc   = calculate_position_size(latest_close, equity_usdc)
 
             result = await client.place_market_order(
                 side=order_side,
@@ -202,14 +213,17 @@ async def trading_loop(client: DydxClient):
                 )
                 _write_open_trade(order_side, entry_price, sl_price, tp_price, size_btc)
 
+                collateral = equity_usdc * cfg.position_size_pct
                 dry = result.get("status") == "DRY_RUN"
                 await send_alert(
                     f"{'🔵 [DRY RUN] ' if dry else ''}✅ <b>Order Placed</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"Side  : <code>{order_side}</code>\n"
-                    f"Size  : <code>{size_btc} BTC</code>\n"
-                    f"Entry : <code>${entry_price:,.2f}</code>\n"
-                    f"SL    : <code>${sl_price:,.2f}</code>  |  TP: <code>${tp_price:,.2f}</code>"
+                    f"Side        : <code>{order_side}</code>\n"
+                    f"Size        : <code>{size_btc} BTC</code>\n"
+                    f"Collateral  : <code>${collateral:.2f} USDC ({cfg.position_size_pct*100:.0f}% of equity)</code>\n"
+                    f"Leverage    : <code>{cfg.leverage}x</code>\n"
+                    f"Entry       : <code>${entry_price:,.2f}</code>\n"
+                    f"SL          : <code>${sl_price:,.2f}</code>  |  TP: <code>${tp_price:,.2f}</code>"
                 )
 
             consecutive_errors = 0
