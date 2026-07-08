@@ -27,25 +27,30 @@ _DEFAULTS = {
     "candle_resolution":    os.getenv("CANDLE_RESOLUTION", "1MIN"),
     "candle_limit":         int(os.getenv("CANDLE_LIMIT", 100)),
     "poll_interval":        int(os.getenv("POLL_INTERVAL_SECONDS", 60)),
-    "position_size_pct":    float(os.getenv("POSITION_SIZE_PCT", 0.10)),  # fraction of equity, e.g. 0.10 = 10%
+    "position_size_pct":    float(os.getenv("POSITION_SIZE_PCT", 0.10)),
     "leverage":             float(os.getenv("LEVERAGE", 1)),
     "stop_loss_pct":        float(os.getenv("STOP_LOSS_PCT", 0.015)),
     "take_profit_pct":      float(os.getenv("TAKE_PROFIT_PCT", 0.03)),
     "max_daily_loss_usdc":  float(os.getenv("MAX_DAILY_LOSS_USDC", 100)),
     "dry_run":              os.getenv("DRY_RUN", "false").lower() == "true",
-    "paused":               False,   # set by Telegram /pause
+    "paused":               False,
     "log_level":            os.getenv("LOG_LEVEL", "INFO"),
-    # SMC Strategy Parameters
-    "min_bos_count":        int(os.getenv("MIN_BOS_COUNT", 2)),           # min BOS events before CHOCH triggers signal
-    "swing_length":         int(os.getenv("SWING_LENGTH", 5)),            # bars lookback for swing detection
-    "supertrend_atr_period": int(os.getenv("SUPERTREND_ATR_PERIOD", 10)), # ATR period for SuperTrend
-    "supertrend_multiplier": float(os.getenv("SUPERTREND_MULTIPLIER", 3.0)), # ATR multiplier for SuperTrend
+    # ── Hydra Engine Parameters ──
+    "signal_threshold":     int(os.getenv("SIGNAL_THRESHOLD", 60)),
+    "trailing_atr_mult":    float(os.getenv("TRAILING_ATR_MULT", 1.5)),
+    "max_hold_candles":     int(os.getenv("MAX_HOLD_CANDLES", 15)),
+    "partial_tp_pct":       float(os.getenv("PARTIAL_TP_PCT", 0.5)),
+    "cooldown_candles":     int(os.getenv("COOLDOWN_CANDLES", 2)),
+    "ema_fast":             int(os.getenv("EMA_FAST", 8)),
+    "rsi_period":           int(os.getenv("RSI_PERIOD", 7)),
+    "bb_period":            int(os.getenv("BB_PERIOD", 20)),
+    "adaptive_threshold":   os.getenv("ADAPTIVE_THRESHOLD", "true").lower() == "true",
     # Dry-run simulation
-    "dry_run_equity":       float(os.getenv("DRY_RUN_EQUITY", 1000.0)),   # simulated starting equity for dry-run
+    "dry_run_equity":       float(os.getenv("DRY_RUN_EQUITY", 1000.0)),
 }
 
 # Valid choices for constrained fields
-VALID_RESOLUTIONS = ["1MIN", "5MINS", "15MINS", "30MINS", "1HOUR", "4HOURS", "1DAY"]  # Note: 1MIN (no S) — dYdX API rejects '1MINS'
+VALID_RESOLUTIONS = ["1MIN", "5MINS", "15MINS", "30MINS", "1HOUR", "4HOURS", "1DAY"]
 VALID_NETWORKS    = ["mainnet", "testnet"]
 
 
@@ -67,6 +72,10 @@ class _Config:
         if CONFIG_FILE.exists():
             try:
                 saved = json.loads(CONFIG_FILE.read_text())
+                # Remove old SMC keys that no longer exist
+                old_keys = {"min_bos_count", "swing_length", "supertrend_atr_period", "supertrend_multiplier"}
+                for k in old_keys:
+                    saved.pop(k, None)
                 self._data = {**_DEFAULTS, **saved}
                 logger.debug("Loaded runtime config from file.")
                 return
@@ -127,14 +136,22 @@ class _Config:
             raise ValueError("Stop loss must be between 0.1% and 50%")
         if key == "take_profit_pct" and not (0.001 <= float(value) <= 1.0):
             raise ValueError("Take profit must be between 0.1% and 100%")
-        if key == "min_bos_count" and not (1 <= int(value) <= 10):
-            raise ValueError("Min BOS count must be between 1 and 10")
-        if key == "swing_length" and not (2 <= int(value) <= 50):
-            raise ValueError("Swing length must be between 2 and 50")
-        if key == "supertrend_atr_period" and not (1 <= int(value) <= 50):
-            raise ValueError("SuperTrend ATR period must be between 1 and 50")
-        if key == "supertrend_multiplier" and not (0.5 <= float(value) <= 10.0):
-            raise ValueError("SuperTrend multiplier must be between 0.5 and 10.0")
+        if key == "signal_threshold" and not (20 <= int(value) <= 95):
+            raise ValueError("Signal threshold must be between 20 and 95")
+        if key == "trailing_atr_mult" and not (0.5 <= float(value) <= 5.0):
+            raise ValueError("Trailing ATR multiplier must be between 0.5 and 5.0")
+        if key == "max_hold_candles" and not (3 <= int(value) <= 120):
+            raise ValueError("Max hold candles must be between 3 and 120")
+        if key == "partial_tp_pct" and not (0.1 <= float(value) <= 0.9):
+            raise ValueError("Partial TP % must be between 10% and 90%")
+        if key == "cooldown_candles" and not (0 <= int(value) <= 20):
+            raise ValueError("Cooldown candles must be between 0 and 20")
+        if key == "ema_fast" and not (3 <= int(value) <= 20):
+            raise ValueError("EMA fast period must be between 3 and 20")
+        if key == "rsi_period" and not (3 <= int(value) <= 21):
+            raise ValueError("RSI period must be between 3 and 21")
+        if key == "bb_period" and not (10 <= int(value) <= 50):
+            raise ValueError("BB period must be between 10 and 50")
         if key == "dry_run_equity" and not (10.0 <= float(value) <= 1000000.0):
             raise ValueError("Dry-run equity must be between $10 and $1,000,000")
 

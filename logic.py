@@ -1,23 +1,29 @@
 """
-logic.py — SMC + SuperTrend Strategy Engine
-Implements Smart Money Concepts (BOS/CHOCH state machine, Order Blocks,
-Fair Value Gaps, Premium/Discount Zones) with SuperTrend confirmation.
+logic.py — Hydra Engine: Multi-Indicator Adaptive Scalping Strategy
 
-Signal flow:
-  1. Detect swing highs/lows
-  2. Track BOS (Break of Structure) events — need ≥ min_bos_count
-  3. Detect CHOCH (Change of Character) — trend reversal
-  4. Confirm direction with SuperTrend
-  5. Optional confluence: Order Block / FVG / Premium-Discount zone
-  → Output: BUY / SELL / HOLD + exit signals
+7 independent signal generators vote with configurable weights.
+A trade triggers when the weighted score crosses a threshold.
 
-Ported from LuxAlgo Smart Money Concepts (PineScript v5)
-and SuperTrend indicator (PineScript v4).
+Signal Heads:
+  1. EMA Ribbon (8/13/21/55)      — Trend direction & alignment   (20%)
+  2. RSI (7) + Divergence          — Momentum & exhaustion         (15%)
+  3. VWAP Bands (±1σ, ±2σ)        — Institutional fair value      (15%)
+  4. Bollinger Band Squeeze        — Volatility breakout           (15%)
+  5. Keltner Channel               — Breakout confirmation         (10%)
+  6. Volume Profile (RVOL)         — Volume confirmation           (15%)
+  7. ATR Regime Filter             — Volatility regime gate        (10%)
+
+Exit layers:
+  - Trailing stop (ATR-based, tightens with profit)
+  - Partial TP at 1× ATR
+  - Score reversal exit
+  - Time-based exit (max hold candles)
+  - Emergency SL (hard %)
 """
 
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -33,567 +39,625 @@ BEAR = -1
 # ───────────────────────────────────────────────────────────
 
 @dataclass
-class SwingPoint:
-    """A detected swing high or low."""
-    index: int
-    price: float
-    is_high: bool  # True = swing high, False = swing low
-
-
-@dataclass
-class StructureEvent:
-    """A BOS or CHOCH event."""
-    index: int
-    event_type: str   # "BOS" or "CHOCH"
-    direction: int    # BULL (+1) or BEAR (-1)
-    price: float      # the swing level that was broken
-
-
-@dataclass
-class OrderBlock:
-    """An order block zone."""
-    index: int
-    high: float
-    low: float
-    bias: int         # BULL or BEAR
-    mitigated: bool = False
-
-
-@dataclass
-class FairValueGap:
-    """A fair value gap (3-candle imbalance)."""
-    index: int
-    top: float
-    bottom: float
-    bias: int         # BULL or BEAR
-    filled: bool = False
-
-
-@dataclass
 class SignalResult:
-    """Rich signal output from the strategy engine."""
-    signal: int           # 1=BUY, -1=SELL, 0=HOLD
-    exit_signal: bool     # True if current position should be closed
-    exit_reason: str      # "choch_reversal", "none"
-    smc_trend: int        # current SMC trend direction
-    supertrend_dir: int   # current SuperTrend direction
-    bos_count: int        # consecutive BOS count in current trend
-    last_event: str       # description of latest structure event
-    confluence: List[str] # list of confirming factors
+    """Rich signal output from the Hydra Engine."""
+    signal: int             # 1=BUY, -1=SELL, 0=HOLD
+    score: float            # aggregate weighted score (-100 to +100)
+    exit_signal: bool       # True if current position should be closed
+    exit_reason: str        # reason for exit
+    regime: str             # "dead", "normal", "volatile"
+    trailing_sl: float      # computed trailing stop level
+    indicator_votes: Dict[str, float]  # per-indicator vote detail
+    confluence: List[str]   # list of confirming factors
+    atr: float              # current ATR value for position mgmt
 
 
 # ───────────────────────────────────────────────────────────
-# SuperTrend Indicator (ported from PineScript v4)
+# Indicator 1: EMA Ribbon (weight: 20%)
 # ───────────────────────────────────────────────────────────
 
-def compute_supertrend(
+def compute_ema_ribbon(
     df: pd.DataFrame,
-    atr_period: int = 10,
-    multiplier: float = 3.0,
-) -> pd.DataFrame:
+    fast: int = 8,
+    mid1: int = 13,
+    mid2: int = 21,
+    slow: int = 55,
+) -> Dict:
     """
-    Compute SuperTrend indicator.
-
-    Returns df with added columns:
-      - supertrend_dir: +1 (bullish) or -1 (bearish)
-      - supertrend_upper: upper band
-      - supertrend_lower: lower band
-      - supertrend_buy: True on bullish flip
-      - supertrend_sell: True on bearish flip
+    Compute 4-EMA ribbon alignment.
+    Returns vote: +1 (bullish aligned), -1 (bearish aligned), 0 (mixed).
+    Also returns trend strength (how many EMA pairs are in order).
     """
-    high = df["high"].values
-    low = df["low"].values
-    close = df["close"].values
-    n = len(df)
+    close = df["close"]
+    ema_f = close.ewm(span=fast, adjust=False).mean()
+    ema_m1 = close.ewm(span=mid1, adjust=False).mean()
+    ema_m2 = close.ewm(span=mid2, adjust=False).mean()
+    ema_s = close.ewm(span=slow, adjust=False).mean()
 
-    # ATR calculation
-    tr = np.zeros(n)
-    for i in range(1, n):
-        tr[i] = max(
-            high[i] - low[i],
-            abs(high[i] - close[i - 1]),
-            abs(low[i] - close[i - 1]),
-        )
-    tr[0] = high[0] - low[0]
+    f = ema_f.iloc[-1]
+    m1 = ema_m1.iloc[-1]
+    m2 = ema_m2.iloc[-1]
+    s = ema_s.iloc[-1]
+    price = close.iloc[-1]
 
-    atr = np.zeros(n)
-    # SMA for first atr_period bars, then rolling
-    if n >= atr_period:
-        atr[atr_period - 1] = np.mean(tr[:atr_period])
-        for i in range(atr_period, n):
-            atr[i] = (atr[i - 1] * (atr_period - 1) + tr[i]) / atr_period
+    # Count aligned pairs for strength
+    bull_pairs = sum([
+        price > f,
+        f > m1,
+        m1 > m2,
+        m2 > s,
+    ])
+    bear_pairs = sum([
+        price < f,
+        f < m1,
+        m1 < m2,
+        m2 < s,
+    ])
+
+    # Check for EMA crossover on last 2 bars (momentum trigger)
+    cross_bull = ema_f.iloc[-1] > ema_m1.iloc[-1] and ema_f.iloc[-2] <= ema_m1.iloc[-2]
+    cross_bear = ema_f.iloc[-1] < ema_m1.iloc[-1] and ema_f.iloc[-2] >= ema_m1.iloc[-2]
+
+    if bull_pairs >= 3:
+        vote = min(bull_pairs / 4.0, 1.0)
+        if cross_bull:
+            vote = min(vote + 0.25, 1.0)
+    elif bear_pairs >= 3:
+        vote = -min(bear_pairs / 4.0, 1.0)
+        if cross_bear:
+            vote = max(vote - 0.25, -1.0)
     else:
-        atr[:] = np.mean(tr)
+        vote = 0.0
 
-    src = (high + low) / 2.0  # hl2
+    factors = []
+    if bull_pairs == 4:
+        factors.append("ema_perfect_bull")
+    elif bear_pairs == 4:
+        factors.append("ema_perfect_bear")
+    if cross_bull:
+        factors.append("ema_cross_bull")
+    if cross_bear:
+        factors.append("ema_cross_bear")
 
-    # Upper and lower bands
-    up = np.zeros(n)
-    dn = np.zeros(n)
-    trend = np.ones(n, dtype=int)
-
-    up[0] = src[0] - multiplier * max(atr[0], 0.0001)
-    dn[0] = src[0] + multiplier * max(atr[0], 0.0001)
-
-    for i in range(1, n):
-        a = max(atr[i], 0.0001)
-        up_val = src[i] - multiplier * a
-        dn_val = src[i] + multiplier * a
-
-        # Ratchet up/dn
-        up[i] = max(up_val, up[i - 1]) if close[i - 1] > up[i - 1] else up_val
-        dn[i] = min(dn_val, dn[i - 1]) if close[i - 1] < dn[i - 1] else dn_val
-
-        # Trend
-        prev_trend = trend[i - 1]
-        if prev_trend == -1 and close[i] > dn[i - 1]:
-            trend[i] = 1
-        elif prev_trend == 1 and close[i] < up[i - 1]:
-            trend[i] = -1
-        else:
-            trend[i] = prev_trend
-
-    buy_signal = np.zeros(n, dtype=bool)
-    sell_signal = np.zeros(n, dtype=bool)
-    for i in range(1, n):
-        buy_signal[i] = (trend[i] == 1) and (trend[i - 1] == -1)
-        sell_signal[i] = (trend[i] == -1) and (trend[i - 1] == 1)
-
-    df = df.copy()
-    df["supertrend_dir"] = trend
-    df["supertrend_upper"] = dn  # upper band (resistance in downtrend)
-    df["supertrend_lower"] = up  # lower band (support in uptrend)
-    df["supertrend_buy"] = buy_signal
-    df["supertrend_sell"] = sell_signal
-
-    return df
+    return {"vote": vote, "factors": factors}
 
 
 # ───────────────────────────────────────────────────────────
-# SMC Engine — Stateful Analysis
+# Indicator 2: RSI + Divergence (weight: 15%)
 # ───────────────────────────────────────────────────────────
 
-class SMCEngine:
+def _rsi(close: np.ndarray, period: int) -> np.ndarray:
+    """Compute RSI array."""
+    delta = np.diff(close, prepend=close[0])
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+
+    avg_gain = np.zeros_like(close)
+    avg_loss = np.zeros_like(close)
+
+    if len(close) > period:
+        avg_gain[period] = np.mean(gain[1:period + 1])
+        avg_loss[period] = np.mean(loss[1:period + 1])
+        for i in range(period + 1, len(close)):
+            avg_gain[i] = (avg_gain[i - 1] * (period - 1) + gain[i]) / period
+            avg_loss[i] = (avg_loss[i - 1] * (period - 1) + loss[i]) / period
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rs = np.where(avg_loss > 0, avg_gain / avg_loss, 100.0)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi
+
+
+def compute_rsi_signal(df: pd.DataFrame, period: int = 7) -> Dict:
     """
-    Smart Money Concepts engine.
+    RSI with divergence detection.
+    Vote: +1 (oversold bounce / bullish div), -1 (overbought reject / bearish div), 0 neutral.
+    """
+    close = df["close"].values
+    rsi = _rsi(close, period)
 
-    Tracks swing structure, detects BOS/CHOCH events,
-    identifies order blocks and fair value gaps.
-    Maintains a state machine for signal generation.
+    current_rsi = rsi[-1]
+    prev_rsi = rsi[-2] if len(rsi) > 1 else 50.0
+
+    vote = 0.0
+    factors = []
+
+    # Oversold/overbought zones
+    if current_rsi < 30:
+        if current_rsi > prev_rsi:  # bouncing up from oversold
+            vote = 0.8
+            factors.append("rsi_oversold_bounce")
+        else:
+            vote = 0.4  # still oversold but falling — partial bull
+            factors.append("rsi_oversold")
+    elif current_rsi > 70:
+        if current_rsi < prev_rsi:  # dropping from overbought
+            vote = -0.8
+            factors.append("rsi_overbought_reject")
+        else:
+            vote = -0.4
+            factors.append("rsi_overbought")
+    elif 45 <= current_rsi <= 55:
+        vote = 0.0  # neutral zone
+    elif current_rsi > 55:
+        vote = (current_rsi - 50) / 50.0  # mild bullish 0-0.4
+    else:
+        vote = -(50 - current_rsi) / 50.0  # mild bearish 0 to -0.4
+
+    # Divergence detection (look back 10 bars)
+    lookback = min(10, len(close) - 1)
+    if lookback >= 5:
+        price_window = close[-lookback:]
+        rsi_window = rsi[-lookback:]
+
+        # Bullish divergence: price making lower low, RSI making higher low
+        price_ll = price_window[-1] < np.min(price_window[:-1])
+        rsi_hl = rsi_window[-1] > np.min(rsi_window[:-1])
+        if price_ll and rsi_hl and current_rsi < 40:
+            vote = max(vote, 0.9)
+            factors.append("rsi_bullish_divergence")
+
+        # Bearish divergence: price making higher high, RSI making lower high
+        price_hh = price_window[-1] > np.max(price_window[:-1])
+        rsi_lh = rsi_window[-1] < np.max(rsi_window[:-1])
+        if price_hh and rsi_lh and current_rsi > 60:
+            vote = min(vote, -0.9)
+            factors.append("rsi_bearish_divergence")
+
+    return {"vote": np.clip(vote, -1.0, 1.0), "factors": factors}
+
+
+# ───────────────────────────────────────────────────────────
+# Indicator 3: VWAP Bands (weight: 15%)
+# ───────────────────────────────────────────────────────────
+
+def compute_vwap_bands(df: pd.DataFrame) -> Dict:
+    """
+    Compute VWAP with ±1σ and ±2σ bands.
+    Vote based on price position relative to VWAP.
+    """
+    typical = (df["high"] + df["low"] + df["close"]) / 3.0
+    volume = df["volume"].replace(0, np.nan).fillna(1.0)
+
+    cum_vol = volume.cumsum()
+    cum_tp_vol = (typical * volume).cumsum()
+    vwap = cum_tp_vol / cum_vol
+
+    # Standard deviation bands
+    cum_tp2_vol = (typical ** 2 * volume).cumsum()
+    variance = (cum_tp2_vol / cum_vol) - (vwap ** 2)
+    variance = variance.clip(lower=0)
+    std = np.sqrt(variance)
+
+    price = df["close"].iloc[-1]
+    v = vwap.iloc[-1]
+    s = max(std.iloc[-1], 0.0001)
+
+    band_1_upper = v + s
+    band_1_lower = v - s
+    band_2_upper = v + 2 * s
+    band_2_lower = v - 2 * s
+
+    vote = 0.0
+    factors = []
+
+    deviation = (price - v) / s if s > 0 else 0
+
+    if price <= band_2_lower:
+        vote = 0.9  # extreme discount — mean reversion long
+        factors.append("vwap_extreme_discount")
+    elif price <= band_1_lower:
+        vote = 0.6
+        factors.append("vwap_discount")
+    elif price >= band_2_upper:
+        vote = -0.9  # extreme premium — mean reversion short
+        factors.append("vwap_extreme_premium")
+    elif price >= band_1_upper:
+        vote = -0.6
+        factors.append("vwap_premium")
+    else:
+        # Near VWAP — check direction
+        prev_price = df["close"].iloc[-2]
+        if price > v and prev_price <= v:
+            vote = 0.3
+            factors.append("vwap_cross_above")
+        elif price < v and prev_price >= v:
+            vote = -0.3
+            factors.append("vwap_cross_below")
+
+    return {"vote": np.clip(vote, -1.0, 1.0), "factors": factors, "vwap": v}
+
+
+# ───────────────────────────────────────────────────────────
+# Indicator 4: Bollinger Band Squeeze (weight: 15%)
+# ───────────────────────────────────────────────────────────
+
+def compute_bollinger(df: pd.DataFrame, period: int = 20, num_std: float = 2.0) -> Dict:
+    """
+    Bollinger Bands with squeeze detection.
+    Squeeze = bands contracting (low volatility) → expansion = breakout signal.
+    """
+    close = df["close"]
+    sma = close.rolling(period).mean()
+    std = close.rolling(period).std()
+
+    upper = sma + num_std * std
+    lower = sma - num_std * std
+    bandwidth = ((upper - lower) / sma * 100)
+
+    price = close.iloc[-1]
+    u = upper.iloc[-1]
+    l = lower.iloc[-1]
+    m = sma.iloc[-1]
+
+    vote = 0.0
+    factors = []
+
+    # Detect squeeze: bandwidth in bottom 20th percentile of last 50 bars
+    bw_window = bandwidth.dropna().tail(50)
+    if len(bw_window) >= 10:
+        bw_pctile = (bandwidth.iloc[-1] - bw_window.min()) / (bw_window.max() - bw_window.min() + 0.0001)
+        is_squeeze = bw_pctile < 0.20
+        expanding = bandwidth.iloc[-1] > bandwidth.iloc[-2] if len(bandwidth) > 1 else False
+
+        if is_squeeze and expanding:
+            # Squeeze firing — direction from price vs middle band
+            if price > m:
+                vote = 0.8
+                factors.append("bb_squeeze_bull_breakout")
+            else:
+                vote = -0.8
+                factors.append("bb_squeeze_bear_breakout")
+        elif is_squeeze:
+            factors.append("bb_in_squeeze")
+            # No directional vote during squeeze (waiting)
+        else:
+            # Normal BB — check for band walks and bounces
+            bb_pct = (price - l) / (u - l + 0.0001)
+
+            if bb_pct >= 0.95:  # walking upper band
+                if close.iloc[-2] < upper.iloc[-2]:
+                    vote = 0.5  # just broke above — bullish
+                    factors.append("bb_upper_break")
+                else:
+                    vote = -0.3  # extended — possible reversal
+                    factors.append("bb_upper_extended")
+            elif bb_pct <= 0.05:  # walking lower band
+                if close.iloc[-2] > lower.iloc[-2]:
+                    vote = -0.5
+                    factors.append("bb_lower_break")
+                else:
+                    vote = 0.3  # extreme oversold bounce
+                    factors.append("bb_lower_bounce")
+            elif 0.4 <= bb_pct <= 0.6:
+                vote = 0.0  # middle zone, neutral
+
+    return {"vote": np.clip(vote, -1.0, 1.0), "factors": factors}
+
+
+# ───────────────────────────────────────────────────────────
+# Indicator 5: Keltner Channel (weight: 10%)
+# ───────────────────────────────────────────────────────────
+
+def compute_keltner(df: pd.DataFrame, period: int = 20, atr_mult: float = 1.5) -> Dict:
+    """
+    Keltner Channel breakout detection.
+    """
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
+
+    ema_mid = close.ewm(span=period, adjust=False).mean()
+
+    # ATR
+    tr = pd.DataFrame({
+        "hl": high - low,
+        "hc": (high - close.shift(1)).abs(),
+        "lc": (low - close.shift(1)).abs(),
+    }).max(axis=1)
+    atr = tr.ewm(span=period, adjust=False).mean()
+
+    kc_upper = ema_mid + atr_mult * atr
+    kc_lower = ema_mid - atr_mult * atr
+
+    price = close.iloc[-1]
+    prev = close.iloc[-2]
+    u = kc_upper.iloc[-1]
+    l = kc_lower.iloc[-1]
+    prev_u = kc_upper.iloc[-2]
+    prev_l = kc_lower.iloc[-2]
+
+    vote = 0.0
+    factors = []
+
+    if price > u and prev <= prev_u:
+        vote = 0.9
+        factors.append("keltner_upper_breakout")
+    elif price < l and prev >= prev_l:
+        vote = -0.9
+        factors.append("keltner_lower_breakout")
+    elif price > u:
+        vote = 0.4  # already above — trend continuation
+        factors.append("keltner_above_upper")
+    elif price < l:
+        vote = -0.4
+        factors.append("keltner_below_lower")
+    elif price > ema_mid.iloc[-1]:
+        vote = 0.1
+    else:
+        vote = -0.1
+
+    return {"vote": np.clip(vote, -1.0, 1.0), "factors": factors}
+
+
+# ───────────────────────────────────────────────────────────
+# Indicator 6: Volume Profile — RVOL (weight: 15%)
+# ───────────────────────────────────────────────────────────
+
+def compute_volume_profile(df: pd.DataFrame, lookback: int = 20) -> Dict:
+    """
+    Relative Volume (RVOL) — current volume vs average.
+    High volume confirms real moves; low volume = fakeout risk.
+    """
+    vol = df["volume"]
+    avg_vol = vol.rolling(lookback).mean()
+
+    current_vol = vol.iloc[-1]
+    avg = avg_vol.iloc[-1] if not np.isnan(avg_vol.iloc[-1]) else vol.mean()
+
+    rvol = current_vol / max(avg, 0.001)
+
+    vote = 0.0
+    factors = []
+
+    # Volume doesn't have a direction — it amplifies the price direction
+    price_change = df["close"].iloc[-1] - df["close"].iloc[-2]
+
+    if rvol >= 2.0:
+        # Very high volume — strong confirmation
+        vote = 1.0 if price_change > 0 else -1.0
+        factors.append(f"rvol_spike_{rvol:.1f}x")
+    elif rvol >= 1.5:
+        vote = 0.7 if price_change > 0 else -0.7
+        factors.append(f"rvol_high_{rvol:.1f}x")
+    elif rvol >= 1.0:
+        vote = 0.3 if price_change > 0 else -0.3
+        factors.append(f"rvol_normal_{rvol:.1f}x")
+    else:
+        # Low volume — weak signal, penalize
+        vote = 0.0
+        factors.append(f"rvol_low_{rvol:.1f}x")
+
+    return {"vote": np.clip(vote, -1.0, 1.0), "factors": factors, "rvol": rvol}
+
+
+# ───────────────────────────────────────────────────────────
+# Indicator 7: ATR Regime Filter (weight: 10%)
+# ───────────────────────────────────────────────────────────
+
+def compute_atr_regime(df: pd.DataFrame, period: int = 14) -> Dict:
+    """
+    Classify market volatility into regimes:
+      - dead: ATR < 30th percentile → skip trades
+      - normal: 30th–70th percentile → standard trading
+      - volatile: > 70th percentile → tighter stops, wider targets
+    """
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+
+    tr = pd.DataFrame({
+        "hl": high - low,
+        "hc": (high - close.shift(1)).abs(),
+        "lc": (low - close.shift(1)).abs(),
+    }).max(axis=1)
+    atr = tr.ewm(span=period, adjust=False).mean()
+
+    current_atr = atr.iloc[-1]
+
+    # Use last 100 bars for percentile ranking
+    atr_window = atr.tail(min(100, len(atr)))
+    if len(atr_window) < 10:
+        return {"vote": 0.0, "factors": ["insufficient_data"], "regime": "normal", "atr": current_atr}
+
+    pctile = (atr_window < current_atr).sum() / len(atr_window)
+
+    if pctile < 0.25:
+        regime = "dead"
+        vote = 0.0  # don't amplify signals in dead markets
+        factors = ["regime_dead"]
+    elif pctile > 0.75:
+        regime = "volatile"
+        vote = 0.5  # volatile = good for scalping (directional based on trend)
+        price_dir = df["close"].iloc[-1] - df["close"].iloc[-3]
+        if price_dir > 0:
+            vote = 0.5
+        elif price_dir < 0:
+            vote = -0.5
+        factors = ["regime_volatile"]
+    else:
+        regime = "normal"
+        vote = 0.3
+        price_dir = df["close"].iloc[-1] - df["close"].iloc[-2]
+        if price_dir > 0:
+            vote = 0.3
+        elif price_dir < 0:
+            vote = -0.3
+        factors = ["regime_normal"]
+
+    return {"vote": np.clip(vote, -1.0, 1.0), "factors": factors, "regime": regime, "atr": float(current_atr)}
+
+
+# ───────────────────────────────────────────────────────────
+# Hydra Engine — Orchestrator
+# ───────────────────────────────────────────────────────────
+
+# Default indicator weights (sum to 100)
+DEFAULT_WEIGHTS = {
+    "ema_ribbon": 20,
+    "rsi": 15,
+    "vwap": 15,
+    "bollinger": 15,
+    "keltner": 10,
+    "volume": 15,
+    "atr_regime": 10,
+}
+
+
+class HydraEngine:
+    """
+    Multi-indicator voting engine.
+    Each indicator returns a vote in [-1, +1].
+    Votes are multiplied by weights and summed.
+    Trade triggers when |score| >= threshold.
     """
 
     def __init__(
         self,
-        swing_length: int = 5,
-        min_bos_count: int = 2,
+        weights: Optional[Dict[str, int]] = None,
+        signal_threshold: int = 60,
+        ema_fast: int = 8,
+        rsi_period: int = 7,
+        bb_period: int = 20,
+        trailing_atr_mult: float = 1.5,
+        max_hold_candles: int = 15,
     ):
-        self.swing_length = swing_length
-        self.min_bos_count = min_bos_count
+        self.weights = weights or dict(DEFAULT_WEIGHTS)
+        self.signal_threshold = signal_threshold
+        self.ema_fast = ema_fast
+        self.rsi_period = rsi_period
+        self.bb_period = bb_period
+        self.trailing_atr_mult = trailing_atr_mult
+        self.max_hold_candles = max_hold_candles
 
-        # State
-        self.swing_highs: List[SwingPoint] = []
-        self.swing_lows: List[SwingPoint] = []
-        self.structure_events: List[StructureEvent] = []
-        self.order_blocks: List[OrderBlock] = []
-        self.fair_value_gaps: List[FairValueGap] = []
+    def analyze(self, df: pd.DataFrame) -> SignalResult:
+        """Run all 7 indicators and produce a weighted signal."""
+        default = SignalResult(
+            signal=0, score=0.0, exit_signal=False, exit_reason="none",
+            regime="unknown", trailing_sl=0.0, indicator_votes={},
+            confluence=[], atr=0.0,
+        )
 
-        self.current_trend: int = 0     # BULL or BEAR or 0 (unknown)
-        self.bos_count: int = 0         # consecutive BOS in current trend
-        self.last_swing_high: Optional[SwingPoint] = None
-        self.last_swing_low: Optional[SwingPoint] = None
-        self.high_crossed: bool = False
-        self.low_crossed: bool = False
+        if len(df) < 60:
+            default.exit_reason = "insufficient_data"
+            return default
 
-        # Trailing extremes for premium/discount zones
-        self.trailing_high: float = 0.0
-        self.trailing_low: float = float("inf")
+        # ── Run each indicator head ───────────────────
+        ema_result = compute_ema_ribbon(df, fast=self.ema_fast)
+        rsi_result = compute_rsi_signal(df, period=self.rsi_period)
+        vwap_result = compute_vwap_bands(df)
+        bb_result = compute_bollinger(df, period=self.bb_period)
+        kc_result = compute_keltner(df)
+        vol_result = compute_volume_profile(df)
+        atr_result = compute_atr_regime(df)
 
-    def analyze(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Run full SMC analysis on OHLCV dataframe."""
-        df = df.copy()
-        n = len(df)
-        high = df["high"].values
-        low = df["low"].values
-        close = df["close"].values
-        op = df["open"].values
+        regime = atr_result.get("regime", "normal")
+        current_atr = atr_result.get("atr", 0.0)
 
-        # Initialize output columns
-        df["smc_trend"] = 0
-        df["bos"] = 0
-        df["choch"] = 0
-        df["swing_high"] = np.nan
-        df["swing_low"] = np.nan
-        df["order_block"] = 0
-        df["fvg"] = 0
-        df["bos_count"] = 0
+        # ── Weighted scoring ──────────────────────────
+        votes = {
+            "ema_ribbon": ema_result["vote"],
+            "rsi": rsi_result["vote"],
+            "vwap": vwap_result["vote"],
+            "bollinger": bb_result["vote"],
+            "keltner": kc_result["vote"],
+            "volume": vol_result["vote"],
+            "atr_regime": atr_result["vote"],
+        }
 
-        length = self.swing_length
+        weighted_score = sum(
+            votes[k] * self.weights.get(k, 0) for k in votes
+        )
+        # Score is already on a -100 to +100 scale
 
-        # ── 1. Detect swing points ──────────────────────
-        for i in range(length, n - length):
-            window_high = high[max(0, i - length):i + length + 1]
-            window_low = low[max(0, i - length):i + length + 1]
+        # ── Regime adjustment ─────────────────────────
+        if regime == "dead":
+            # In dead markets, require much higher consensus
+            effective_threshold = self.signal_threshold * 1.5
+            logger.debug(f"Dead market — threshold raised to {effective_threshold}")
+        elif regime == "volatile":
+            # Volatile = slightly lower threshold (momentum is real)
+            effective_threshold = self.signal_threshold * 0.85
+        else:
+            effective_threshold = float(self.signal_threshold)
 
-            if high[i] == np.max(window_high):
-                sp = SwingPoint(index=i, price=high[i], is_high=True)
-                self.swing_highs.append(sp)
-                df.iloc[i, df.columns.get_loc("swing_high")] = high[i]
+        # ── Generate signal ───────────────────────────
+        signal = 0
+        if weighted_score >= effective_threshold:
+            signal = 1  # BUY
+        elif weighted_score <= -effective_threshold:
+            signal = -1  # SELL
 
-            if low[i] == np.min(window_low):
-                sp = SwingPoint(index=i, price=low[i], is_high=False)
-                self.swing_lows.append(sp)
-                df.iloc[i, df.columns.get_loc("swing_low")] = low[i]
+        # ── Collect all confluence factors ────────────
+        confluence = []
+        for r in [ema_result, rsi_result, vwap_result, bb_result, kc_result, vol_result, atr_result]:
+            confluence.extend(r.get("factors", []))
 
-        # ── 2. Detect BOS / CHOCH ───────────────────────
-        for i in range(1, n):
-            c = close[i]
+        # ── Compute trailing stop level ───────────────
+        price = df["close"].iloc[-1]
+        trailing_sl = 0.0
+        if signal == 1:
+            trailing_sl = price - self.trailing_atr_mult * current_atr
+        elif signal == -1:
+            trailing_sl = price + self.trailing_atr_mult * current_atr
 
-            # Get the most recent swing high/low BEFORE this bar
-            recent_sh = [s for s in self.swing_highs if s.index < i]
-            recent_sl = [s for s in self.swing_lows if s.index < i]
+        # ── Exit signal detection ─────────────────────
+        exit_signal = False
+        exit_reason = "none"
 
-            if not recent_sh or not recent_sl:
-                df.iloc[i, df.columns.get_loc("smc_trend")] = self.current_trend
-                df.iloc[i, df.columns.get_loc("bos_count")] = self.bos_count
-                continue
+        # Score reversal: if score strongly opposes current direction
+        if weighted_score <= -30:
+            exit_signal = True
+            exit_reason = "score_reversal_bearish"
+        if weighted_score >= 30:
+            exit_signal = True
+            exit_reason = "score_reversal_bullish"
 
-            last_high = recent_sh[-1]
-            last_low = recent_sl[-1]
+        if signal != 0:
+            label = "BUY 🟢" if signal == 1 else "SELL 🔴"
+            logger.info(
+                f"🐉 {label} | Score: {weighted_score:+.1f}/{effective_threshold:.0f} | "
+                f"Regime: {regime} | Votes: "
+                + " | ".join(f"{k}:{v:+.2f}" for k, v in votes.items())
+            )
 
-            # Update tracking references
-            if self.last_swing_high is None or last_high.index != self.last_swing_high.index:
-                self.last_swing_high = last_high
-                self.high_crossed = False
-            if self.last_swing_low is None or last_low.index != self.last_swing_low.index:
-                self.last_swing_low = last_low
-                self.low_crossed = False
-
-            # ── Bullish break (close > last swing high) ──
-            if c > last_high.price and not self.high_crossed:
-                self.high_crossed = True
-                if self.current_trend == BEAR:
-                    # CHOCH — trend reversal from bear to bull
-                    event = StructureEvent(i, "CHOCH", BULL, last_high.price)
-                    self.structure_events.append(event)
-                    df.iloc[i, df.columns.get_loc("choch")] = BULL
-                    self.bos_count = 0
-                    self._store_order_block(df, i, last_high, BULL, op, close)
-                else:
-                    # BOS — continuation
-                    event = StructureEvent(i, "BOS", BULL, last_high.price)
-                    self.structure_events.append(event)
-                    df.iloc[i, df.columns.get_loc("bos")] = BULL
-                    if self.current_trend == BULL:
-                        self.bos_count += 1
-                    else:
-                        self.bos_count = 1
-                    self._store_order_block(df, i, last_high, BULL, op, close)
-
-                self.current_trend = BULL
-
-            # ── Bearish break (close < last swing low) ──
-            elif c < last_low.price and not self.low_crossed:
-                self.low_crossed = True
-                if self.current_trend == BULL:
-                    # CHOCH — trend reversal from bull to bear
-                    event = StructureEvent(i, "CHOCH", BEAR, last_low.price)
-                    self.structure_events.append(event)
-                    df.iloc[i, df.columns.get_loc("choch")] = BEAR
-                    self.bos_count = 0
-                    self._store_order_block(df, i, last_low, BEAR, op, close)
-                else:
-                    # BOS — continuation
-                    event = StructureEvent(i, "BOS", BEAR, last_low.price)
-                    self.structure_events.append(event)
-                    df.iloc[i, df.columns.get_loc("bos")] = BEAR
-                    if self.current_trend == BEAR:
-                        self.bos_count += 1
-                    else:
-                        self.bos_count = 1
-                    self._store_order_block(df, i, last_low, BEAR, op, close)
-
-                self.current_trend = BEAR
-
-            df.iloc[i, df.columns.get_loc("smc_trend")] = self.current_trend
-            df.iloc[i, df.columns.get_loc("bos_count")] = self.bos_count
-
-        # ── 3. Fair Value Gaps ──────────────────────────
-        for i in range(2, n):
-            h2 = high[i - 2]
-            l2 = low[i - 2]
-            h0 = high[i]
-            l0 = low[i]
-
-            if l0 > h2:  # bullish FVG
-                self.fair_value_gaps.append(
-                    FairValueGap(i, top=l0, bottom=h2, bias=BULL)
-                )
-                df.iloc[i, df.columns.get_loc("fvg")] = BULL
-            elif h0 < l2:  # bearish FVG
-                self.fair_value_gaps.append(
-                    FairValueGap(i, top=l2, bottom=h0, bias=BEAR)
-                )
-                df.iloc[i, df.columns.get_loc("fvg")] = BEAR
-
-        # ── 4. Mitigate order blocks ────────────────────
-        for ob in self.order_blocks:
-            if ob.mitigated:
-                continue
-            for i in range(ob.index + 1, n):
-                if ob.bias == BEAR and high[i] > ob.high:
-                    ob.mitigated = True
-                    break
-                if ob.bias == BULL and low[i] < ob.low:
-                    ob.mitigated = True
-                    break
-
-        # ── 5. Trailing extremes (premium/discount) ────
-        if n > 0:
-            self.trailing_high = float(np.max(high))
-            self.trailing_low = float(np.min(low))
-
-        return df
-
-    def _store_order_block(
-        self, df, break_index, pivot, bias, opens, closes
-    ):
-        """Find and store the order block candle before the structure break."""
-        for j in range(break_index - 1, max(0, break_index - 10), -1):
-            if bias == BULL and closes[j] < opens[j]:
-                # Bullish OB = last bearish candle before bullish break
-                ob = OrderBlock(
-                    index=j,
-                    high=df["high"].iloc[j],
-                    low=df["low"].iloc[j],
-                    bias=BULL,
-                )
-                self.order_blocks.append(ob)
-                df.iloc[j, df.columns.get_loc("order_block")] = BULL
-                break
-            elif bias == BEAR and closes[j] > opens[j]:
-                # Bearish OB = last bullish candle before bearish break
-                ob = OrderBlock(
-                    index=j,
-                    high=df["high"].iloc[j],
-                    low=df["low"].iloc[j],
-                    bias=BEAR,
-                )
-                self.order_blocks.append(ob)
-                df.iloc[j, df.columns.get_loc("order_block")] = BEAR
-                break
-
-    def get_premium_discount(self, price: float) -> str:
-        """Determine if price is in premium, discount, or equilibrium zone."""
-        if self.trailing_high <= self.trailing_low:
-            return "equilibrium"
-        mid = (self.trailing_high + self.trailing_low) / 2.0
-        range_size = self.trailing_high - self.trailing_low
-        if price > mid + 0.1 * range_size:
-            return "premium"
-        elif price < mid - 0.1 * range_size:
-            return "discount"
-        return "equilibrium"
-
-    def get_active_order_blocks(self, bias: int, lookback: int = 20) -> List[OrderBlock]:
-        """Get non-mitigated order blocks of given bias in recent bars."""
-        active = []
-        for ob in reversed(self.order_blocks):
-            if ob.mitigated:
-                continue
-            if ob.bias == bias:
-                active.append(ob)
-            if len(active) >= 5:
-                break
-        return active
-
-    def get_recent_fvgs(self, bias: int, lookback: int = 10) -> List[FairValueGap]:
-        """Get recent unfilled FVGs of given bias."""
-        return [
-            fvg for fvg in self.fair_value_gaps[-lookback:]
-            if fvg.bias == bias and not fvg.filled
-        ]
+        return SignalResult(
+            signal=signal,
+            score=weighted_score,
+            exit_signal=exit_signal,
+            exit_reason=exit_reason,
+            regime=regime,
+            trailing_sl=round(trailing_sl, 2),
+            indicator_votes=votes,
+            confluence=confluence,
+            atr=current_atr,
+        )
 
 
 # ───────────────────────────────────────────────────────────
-# Signal Generator — Combined SMC + SuperTrend
+# Public API — drop-in replacement for old generate_signal()
 # ───────────────────────────────────────────────────────────
 
 def generate_signal(
     df: pd.DataFrame,
-    swing_length: int = 5,
-    min_bos_count: int = 2,
-    supertrend_atr_period: int = 10,
-    supertrend_multiplier: float = 3.0,
+    signal_threshold: int = 60,
+    ema_fast: int = 8,
+    rsi_period: int = 7,
+    bb_period: int = 20,
+    trailing_atr_mult: float = 1.5,
+    max_hold_candles: int = 15,
+    **kwargs,  # absorb any old params gracefully
 ) -> SignalResult:
     """
-    Run SMC + SuperTrend analysis and produce a trading signal.
-
-    Entry logic:
-      - Bullish CHOCH on last candle (trend was bearish, broke bullish)
-      - Prior trend had ≥ min_bos_count bearish BOS (real trend existed)
-      - SuperTrend confirms bullish (dir == 1)
-      - Bonus confluence: bullish OB nearby, bullish FVG, discount zone
-      → BUY
-
-      Mirror for SELL.
-
-    Exit logic:
-      - CHOCH in opposite direction → exit + flip signal
-
-    Args:
-        df: OHLCV DataFrame (open, high, low, close columns required).
-        swing_length: Bars lookback for swing detection.
-        min_bos_count: Min BOS events before CHOCH triggers a signal.
-        supertrend_atr_period: ATR period for SuperTrend.
-        supertrend_multiplier: ATR multiplier for SuperTrend.
-
-    Returns:
-        SignalResult with signal, exit info, and confluence details.
+    Run Hydra Engine analysis and produce a trading signal.
+    Drop-in replacement for the old SMC + SuperTrend generate_signal().
     """
-    default = SignalResult(
-        signal=0, exit_signal=False, exit_reason="none",
-        smc_trend=0, supertrend_dir=0, bos_count=0,
-        last_event="insufficient_data", confluence=[],
+    engine = HydraEngine(
+        signal_threshold=signal_threshold,
+        ema_fast=ema_fast,
+        rsi_period=rsi_period,
+        bb_period=bb_period,
+        trailing_atr_mult=trailing_atr_mult,
+        max_hold_candles=max_hold_candles,
     )
-
-    if len(df) < 20:
-        return default
-
-    # ── 1. Run SuperTrend ─────────────────────────────
-    df = compute_supertrend(df, supertrend_atr_period, supertrend_multiplier)
-
-    # ── 2. Run SMC analysis ───────────────────────────
-    engine = SMCEngine(swing_length=swing_length, min_bos_count=min_bos_count)
-    df = engine.analyze(df)
-
-    last = df.iloc[-1]
-    last_close = float(last["close"])
-    st_dir = int(last["supertrend_dir"])
-    smc_trend = int(last["smc_trend"])
-    bos_count = int(last["bos_count"])
-
-    # ── 3. Check for structure events on recent bars ──
-    # Look at last 3 bars for CHOCH (it may not be exactly on the last bar)
-    lookback = min(3, len(df))
-    recent_choch = None
-    recent_bos_before_choch = 0
-
-    for i in range(-lookback, 0):
-        row = df.iloc[i]
-        if row["choch"] != 0:
-            recent_choch = int(row["choch"])
-            # Count BOS events that preceded this CHOCH
-            # Look at the structure events before the CHOCH
-            idx = len(df) + i
-            prev_rows = df.iloc[max(0, idx - 50):idx]
-            if recent_choch == BULL:
-                # Count bearish BOS before bullish CHOCH
-                recent_bos_before_choch = int((prev_rows["bos"] == BEAR).sum())
-            else:
-                # Count bullish BOS before bearish CHOCH
-                recent_bos_before_choch = int((prev_rows["bos"] == BULL).sum())
-
-    # ── 4. Build confluence factors ───────────────────
-    confluence = []
-
-    # Order blocks
-    if recent_choch == BULL:
-        bull_obs = engine.get_active_order_blocks(BULL)
-        if any(ob.low <= last_close <= ob.high for ob in bull_obs):
-            confluence.append("price_at_bullish_OB")
-        elif bull_obs:
-            confluence.append("bullish_OB_nearby")
-    elif recent_choch == BEAR:
-        bear_obs = engine.get_active_order_blocks(BEAR)
-        if any(ob.low <= last_close <= ob.high for ob in bear_obs):
-            confluence.append("price_at_bearish_OB")
-        elif bear_obs:
-            confluence.append("bearish_OB_nearby")
-
-    # Fair value gaps
-    if recent_choch == BULL and engine.get_recent_fvgs(BULL):
-        confluence.append("bullish_FVG")
-    elif recent_choch == BEAR and engine.get_recent_fvgs(BEAR):
-        confluence.append("bearish_FVG")
-
-    # Premium / Discount zones
-    zone = engine.get_premium_discount(last_close)
-    if recent_choch == BULL and zone == "discount":
-        confluence.append("discount_zone")
-    elif recent_choch == BEAR and zone == "premium":
-        confluence.append("premium_zone")
-
-    # ── 5. Generate signal ────────────────────────────
-    signal = 0
-    exit_signal = False
-    exit_reason = "none"
-    last_event = "no_event"
-
-    if recent_choch is not None:
-        if recent_choch == BULL:
-            last_event = f"bullish_CHOCH (after {recent_bos_before_choch} bearish BOS)"
-            enough_bos = recent_bos_before_choch >= min_bos_count
-            st_agrees = st_dir == 1
-
-            if enough_bos and st_agrees:
-                signal = 1  # BUY
-                confluence.append("supertrend_bullish")
-                logger.info(
-                    f"🟢 BUY signal | Bullish CHOCH after {recent_bos_before_choch} "
-                    f"bearish BOS | SuperTrend ✓ | Confluence: {confluence}"
-                )
-            elif enough_bos:
-                last_event += " [SuperTrend disagrees]"
-                logger.debug(
-                    f"Bullish CHOCH detected but SuperTrend bearish — no signal"
-                )
-            else:
-                last_event += f" [need {min_bos_count} BOS, got {recent_bos_before_choch}]"
-
-            # Exit signal: if we were SHORT, this CHOCH means exit
-            exit_signal = True
-            exit_reason = "choch_reversal"
-
-        elif recent_choch == BEAR:
-            last_event = f"bearish_CHOCH (after {recent_bos_before_choch} bullish BOS)"
-            enough_bos = recent_bos_before_choch >= min_bos_count
-            st_agrees = st_dir == -1
-
-            if enough_bos and st_agrees:
-                signal = -1  # SELL
-                confluence.append("supertrend_bearish")
-                logger.info(
-                    f"🔴 SELL signal | Bearish CHOCH after {recent_bos_before_choch} "
-                    f"bullish BOS | SuperTrend ✓ | Confluence: {confluence}"
-                )
-            elif enough_bos:
-                last_event += " [SuperTrend disagrees]"
-                logger.debug(
-                    f"Bearish CHOCH detected but SuperTrend bullish — no signal"
-                )
-            else:
-                last_event += f" [need {min_bos_count} BOS, got {recent_bos_before_choch}]"
-
-            # Exit signal: if we were LONG, this CHOCH means exit
-            exit_signal = True
-            exit_reason = "choch_reversal"
-    else:
-        # Check for BOS continuation (just log, no trade signal)
-        last_bos = int(last.get("bos", 0))
-        if last_bos == BULL:
-            last_event = f"bullish_BOS (count: {bos_count})"
-        elif last_bos == BEAR:
-            last_event = f"bearish_BOS (count: {bos_count})"
-        else:
-            last_event = "no_structure_event"
-
-    return SignalResult(
-        signal=signal,
-        exit_signal=exit_signal,
-        exit_reason=exit_reason,
-        smc_trend=smc_trend,
-        supertrend_dir=st_dir,
-        bos_count=bos_count,
-        last_event=last_event,
-        confluence=confluence,
-    )
+    return engine.analyze(df)

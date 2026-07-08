@@ -1,12 +1,13 @@
 """
 risk.py — Risk Management Layer
-Handles position sizing, stop-loss, daily loss limits, and dry-run P&L tracking.
-Also exposes get_daily_pnl() and get_daily_pnl_pct() for the Telegram dashboard.
+Handles position sizing, stop-loss (ATR-based trailing), daily loss limits,
+cooldown logic, and dry-run P&L tracking.
 """
 
 import json
 import logging
 import os
+import time
 from datetime import date
 from pathlib import Path
 from typing import Optional, Tuple, List
@@ -32,18 +33,22 @@ def _load_state() -> dict:
             pass
     return {
         "date": str(date.today()),
-        "daily_pnl_usdc": 0.0,     # net P&L (positive = profit, negative = loss)
-        "daily_pnl_pct": 0.0,      # net P&L as % of equity
-        "daily_loss_usdc": 0.0,    # cumulative loss only (for loss-limit guard)
+        "daily_pnl_usdc": 0.0,
+        "daily_pnl_pct": 0.0,
+        "daily_loss_usdc": 0.0,
         "trade_count": 0,
-        "trades": [],              # per-trade details
+        "trades": [],
         # Dry-run simulation state
-        "dry_run_equity": 0.0,     # current simulated equity
+        "dry_run_equity": 0.0,
         "dry_run_starting_equity": 0.0,
-        "dry_run_open_trade": None,  # {"side", "entry", "size"}
+        "dry_run_open_trade": None,
         "dry_run_pnl_usdc": 0.0,
         "dry_run_pnl_pct": 0.0,
         "dry_run_trades": [],
+        # Cooldown & trailing stop state
+        "last_loss_time": 0,
+        "trailing_sl": 0.0,
+        "entry_candle_count": 0,
     }
 
 
@@ -54,7 +59,6 @@ def _save_state(state: dict):
 def _get_daily_state() -> dict:
     state = _load_state()
     if state.get("date") != str(date.today()):
-        # New day — reset all daily counters, preserve dry-run equity
         dry_eq = state.get("dry_run_equity", 0.0)
         dry_start = state.get("dry_run_starting_equity", 0.0)
         dry_open = state.get("dry_run_open_trade")
@@ -71,6 +75,9 @@ def _get_daily_state() -> dict:
             "dry_run_pnl_usdc": 0.0,
             "dry_run_pnl_pct": 0.0,
             "dry_run_trades": [],
+            "last_loss_time": 0,
+            "trailing_sl": 0.0,
+            "entry_candle_count": 0,
         }
         _save_state(state)
     return state
@@ -82,7 +89,7 @@ def record_trade_pnl(pnl_usdc: float, equity: float = 0.0):
     state["daily_pnl_usdc"] = round(state.get("daily_pnl_usdc", 0.0) + pnl_usdc, 4)
     state["trade_count"] = state.get("trade_count", 0) + 1
 
-    # Track P&L percentage
+    pnl_pct = 0.0
     if equity > 0:
         pnl_pct = (pnl_usdc / equity) * 100
         state["daily_pnl_pct"] = round(
@@ -91,36 +98,25 @@ def record_trade_pnl(pnl_usdc: float, equity: float = 0.0):
 
     if pnl_usdc < 0:
         state["daily_loss_usdc"] += abs(pnl_usdc)
+        state["last_loss_time"] = time.time()
 
-    # Store trade detail
     trades = state.get("trades", [])
     trades.append({
         "pnl_usdc": round(pnl_usdc, 4),
-        "pnl_pct": round((pnl_usdc / equity) * 100, 4) if equity > 0 else 0.0,
+        "pnl_pct": round(pnl_pct, 4),
     })
-    state["trades"] = trades[-50:] if isinstance(trades, list) and len(trades) > 50 else trades
+    state["trades"] = trades[-50:] if len(trades) > 50 else trades
 
     _save_state(state)
     logger.info(
         f"Trade #{state['trade_count']} closed | "
         f"PnL: ${pnl_usdc:+.2f} ({pnl_pct:+.2f}%) | "
         f"Day net: ${state['daily_pnl_usdc']:+.2f} USDC ({state['daily_pnl_pct']:+.2f}%)"
-        if equity > 0 else
-        f"Trade #{state['trade_count']} closed | "
-        f"PnL: ${pnl_usdc:+.2f} | "
-        f"Day net: ${state['daily_pnl_usdc']:+.2f} USDC"
     )
 
 
 def get_daily_pnl() -> dict:
-    """
-    Return today's trading summary.
-    Safe to call from anywhere (Telegram UI, dashboard, etc.).
-
-    Returns:
-        dict with keys: date, daily_pnl_usdc, daily_pnl_pct, daily_loss_usdc,
-                        trade_count, trades, dry_run_*
-    """
+    """Return today's trading summary."""
     return _get_daily_state()
 
 
@@ -128,6 +124,154 @@ def get_daily_pnl_pct() -> float:
     """Return today's net P&L as a percentage."""
     state = _get_daily_state()
     return state.get("daily_pnl_pct", 0.0)
+
+
+# -----------------------------------------------------------
+# Cooldown Logic
+# -----------------------------------------------------------
+
+def is_cooldown_active(poll_interval: int) -> bool:
+    """
+    Returns True if we're still within cooldown period after a loss.
+    Cooldown = cooldown_candles × poll_interval seconds.
+    """
+    from config import cfg
+    cooldown_candles = int(cfg.cooldown_candles)
+    if cooldown_candles <= 0:
+        return False
+
+    state = _get_daily_state()
+    last_loss = state.get("last_loss_time", 0)
+    if last_loss <= 0:
+        return False
+
+    cooldown_seconds = cooldown_candles * poll_interval
+    elapsed = time.time() - last_loss
+
+    if elapsed < cooldown_seconds:
+        remaining = cooldown_seconds - elapsed
+        logger.debug(f"Cooldown active: {remaining:.0f}s remaining ({cooldown_candles} candles)")
+        return True
+    return False
+
+
+# -----------------------------------------------------------
+# Trailing Stop Management
+# -----------------------------------------------------------
+
+def update_trailing_stop(
+    current_price: float,
+    side: str,
+    entry_price: float,
+    atr: float,
+    current_trailing_sl: float,
+) -> float:
+    """
+    Compute new trailing stop. Ratchets in favor of profit only.
+    As profit grows, the trailing stop tightens (ATR multiplier decreases).
+
+    Returns the new trailing stop price.
+    """
+    from config import cfg
+    base_mult = float(cfg.trailing_atr_mult)
+
+    if atr <= 0:
+        return current_trailing_sl
+
+    if side == "BUY":
+        profit_pct = (current_price - entry_price) / entry_price
+        # Tighten trailing stop as profit grows
+        if profit_pct > 0.005:  # > 0.5% profit
+            mult = max(base_mult * 0.7, 0.5)  # tighten
+        elif profit_pct > 0.01:
+            mult = max(base_mult * 0.5, 0.3)  # very tight
+        else:
+            mult = base_mult
+
+        new_sl = current_price - mult * atr
+        # Only ratchet up
+        return max(new_sl, current_trailing_sl) if current_trailing_sl > 0 else new_sl
+
+    else:  # SELL
+        profit_pct = (entry_price - current_price) / entry_price
+        if profit_pct > 0.005:
+            mult = max(base_mult * 0.7, 0.5)
+        elif profit_pct > 0.01:
+            mult = max(base_mult * 0.5, 0.3)
+        else:
+            mult = base_mult
+
+        new_sl = current_price + mult * atr
+        # Only ratchet down
+        return min(new_sl, current_trailing_sl) if current_trailing_sl > 0 else new_sl
+
+
+def save_trailing_sl(sl: float):
+    """Persist trailing SL to state file."""
+    state = _get_daily_state()
+    state["trailing_sl"] = round(sl, 2)
+    _save_state(state)
+
+
+def get_trailing_sl() -> float:
+    """Get saved trailing SL."""
+    state = _get_daily_state()
+    return state.get("trailing_sl", 0.0)
+
+
+def increment_hold_counter() -> int:
+    """Increment candle hold counter. Returns current count."""
+    state = _get_daily_state()
+    count = state.get("entry_candle_count", 0) + 1
+    state["entry_candle_count"] = count
+    _save_state(state)
+    return count
+
+
+def reset_hold_counter():
+    """Reset hold counter (called when position closes)."""
+    state = _get_daily_state()
+    state["entry_candle_count"] = 0
+    state["trailing_sl"] = 0.0
+    _save_state(state)
+
+
+# -----------------------------------------------------------
+# Adaptive Threshold
+# -----------------------------------------------------------
+
+def get_adaptive_threshold(base_threshold: int) -> int:
+    """
+    Auto-adjust signal threshold based on recent win rate.
+    Win rate < 50% → increase threshold (more conservative)
+    Win rate > 65% → decrease threshold (more aggressive)
+    """
+    state = _get_daily_state()
+    trades = state.get("trades", [])
+
+    if len(trades) < 5:
+        return base_threshold  # not enough data
+
+    recent = trades[-20:]  # last 20 trades
+    wins = sum(1 for t in recent if t.get("pnl_usdc", 0) > 0)
+    win_rate = wins / len(recent)
+
+    if win_rate < 0.40:
+        adjusted = min(base_threshold + 15, 90)
+        logger.debug(f"Adaptive threshold: WR {win_rate:.0%} → raised to {adjusted}")
+        return adjusted
+    elif win_rate < 0.50:
+        adjusted = min(base_threshold + 8, 85)
+        return adjusted
+    elif win_rate > 0.70:
+        adjusted = max(base_threshold - 10, 30)
+        logger.debug(f"Adaptive threshold: WR {win_rate:.0%} → lowered to {adjusted}")
+        return adjusted
+    elif win_rate > 0.60:
+        adjusted = max(base_threshold - 5, 35)
+        return adjusted
+
+    return base_threshold
 
 
 # -----------------------------------------------------------
@@ -157,12 +301,7 @@ def record_dry_run_entry(side: str, entry_price: float, size: float):
 
 
 def record_dry_run_exit(exit_price: float) -> Optional[dict]:
-    """
-    Record a simulated trade exit, compute P&L.
-
-    Returns:
-        dict with pnl_usdc, pnl_pct, or None if no open dry-run trade.
-    """
+    """Record a simulated trade exit, compute P&L."""
     state = _get_daily_state()
     trade = state.get("dry_run_open_trade")
     if trade is None:
@@ -180,7 +319,6 @@ def record_dry_run_exit(exit_price: float) -> Optional[dict]:
     equity = state.get("dry_run_equity", 1000.0)
     pnl_pct = (pnl_usdc / equity) * 100 if equity > 0 else 0.0
 
-    # Update equity
     state["dry_run_equity"] = round(equity + pnl_usdc, 4)
     state["dry_run_pnl_usdc"] = round(
         state.get("dry_run_pnl_usdc", 0.0) + pnl_usdc, 4
@@ -189,7 +327,6 @@ def record_dry_run_exit(exit_price: float) -> Optional[dict]:
         state.get("dry_run_pnl_pct", 0.0) + pnl_pct, 4
     )
 
-    # Store trade
     dry_trades = state.get("dry_run_trades", [])
     trade_record = {
         "side": side,
@@ -200,9 +337,12 @@ def record_dry_run_exit(exit_price: float) -> Optional[dict]:
         "pnl_pct": round(pnl_pct, 4),
     }
     dry_trades.append(trade_record)
-    state["dry_run_trades"] = dry_trades[-50:]  # keep last 50
+    state["dry_run_trades"] = dry_trades[-50:]
     state["dry_run_open_trade"] = None
     state["trade_count"] = state.get("trade_count", 0) + 1
+
+    if pnl_usdc < 0:
+        state["last_loss_time"] = time.time()
 
     _save_state(state)
     logger.info(
@@ -238,26 +378,15 @@ def get_dry_run_stats() -> dict:
 def calculate_position_size(btc_price: float, equity_usdc: float) -> float:
     """
     Convert equity fraction + leverage → BTC contract size.
-
-    Formula:
-        collateral_usdc = equity_usdc × POSITION_SIZE_PCT
-        size_btc        = (collateral_usdc × LEVERAGE) / btc_price
-
-    Leverage scales the contract size (how many BTC you control),
-    but has NO effect on the SL/TP price levels — those are purely
-    entry_price ± percentage, computed in calculate_sl_tp().
-
     dYdX BTC-USD contract step size = 0.0001 BTC.
-    Reads from cfg singleton so Telegram-changed values apply live.
     """
-    from config import cfg  # late import to avoid circular dependency
-    pct      = float(cfg.position_size_pct)   # e.g. 0.10 for 10%
+    from config import cfg
+    pct      = float(cfg.position_size_pct)
     leverage = float(cfg.leverage)
     min_step = 0.0001
 
     collateral_usdc = equity_usdc * pct
     size_btc = (collateral_usdc * leverage) / btc_price
-    # Round down to nearest step size
     size_btc = round(size_btc - (size_btc % min_step), 4)
 
     if size_btc < min_step:
@@ -277,47 +406,39 @@ def calculate_position_size(btc_price: float, equity_usdc: float) -> float:
 
 
 # -----------------------------------------------------------
-# Stop Loss (SL only — exits are structure-based via CHOCH)
+# Stop Loss (ATR-based + emergency percentage)
 # -----------------------------------------------------------
 
 def calculate_sl(
     entry_price: float,
-    side: str,          # "BUY" or "SELL"
+    side: str,
+    atr: float = 0.0,
     df: Optional[pd.DataFrame] = None,
 ) -> float:
     """
-    Calculate stop-loss price (emergency safety net).
-
-    Uses swing-based SL if df is provided, else falls back to percentage.
-    TP is no longer used — exits are driven by CHOCH signals.
-
-    Args:
-        entry_price: Filled price of the order.
-        side: "BUY" (long) or "SELL" (short).
-        df: Processed SMC DataFrame with swing_high/swing_low columns.
-
-    Returns:
-        stop_loss_price
+    Calculate initial stop-loss price.
+    Uses ATR-based stop if atr > 0, else falls back to percentage.
     """
-    from config import cfg  # late import to avoid circular dependency
+    from config import cfg
     sl_pct = float(cfg.stop_loss_pct)
+    trailing_mult = float(cfg.trailing_atr_mult)
 
-    # Try swing-based SL
-    if df is not None and "swing_high" in df.columns and "swing_low" in df.columns:
-        recent_lows = df["swing_low"].dropna()
-        recent_highs = df["swing_high"].dropna()
+    # ATR-based SL
+    if atr > 0:
+        if side == "BUY":
+            sl = entry_price - trailing_mult * atr
+        else:
+            sl = entry_price + trailing_mult * atr
 
-        if side == "BUY" and len(recent_lows) > 0:
-            swing_sl = recent_lows.iloc[-1]
-            if swing_sl > entry_price * (1 - sl_pct * 2):
-                logger.debug(f"Swing-based SL: {swing_sl:.2f}")
-                return round(swing_sl, 2)
+        # Clamp: never wider than 2× the percentage SL
+        max_sl_dist = entry_price * sl_pct * 2
+        if side == "BUY":
+            sl = max(sl, entry_price - max_sl_dist)
+        else:
+            sl = min(sl, entry_price + max_sl_dist)
 
-        elif side == "SELL" and len(recent_highs) > 0:
-            swing_sl = recent_highs.iloc[-1]
-            if swing_sl < entry_price * (1 + sl_pct * 2):
-                logger.debug(f"Swing-based SL: {swing_sl:.2f}")
-                return round(swing_sl, 2)
+        logger.debug(f"ATR-based SL: {sl:.2f} (ATR={atr:.2f}, mult={trailing_mult})")
+        return round(sl, 2)
 
     # Fallback: fixed percentage
     if side == "BUY":
@@ -335,11 +456,10 @@ def calculate_sl_tp(
     side: str,
     df: Optional[pd.DataFrame] = None,
 ) -> Tuple[float, float]:
-    """Backwards-compatible wrapper. TP is set far away since exits are CHOCH-based."""
-    sl = calculate_sl(entry_price, side, df)
-    # Set TP very far away — actual exit is via CHOCH signal
+    """Backwards-compatible wrapper."""
+    sl = calculate_sl(entry_price, side, df=df)
     if side == "BUY":
-        tp = entry_price * 1.50  # 50% — effectively disabled
+        tp = entry_price * 1.50
     else:
         tp = entry_price * 0.50
     return sl, tp
@@ -351,7 +471,7 @@ def calculate_sl_tp(
 
 def is_daily_loss_limit_hit() -> bool:
     """Returns True if today's loss has exceeded MAX_DAILY_LOSS_USDC."""
-    from config import cfg  # late import to avoid circular dependency
+    from config import cfg
     max_loss = float(cfg.max_daily_loss_usdc)
     state = _get_daily_state()
     loss = state.get("daily_loss_usdc", 0.0)
@@ -372,15 +492,12 @@ def is_daily_loss_limit_hit() -> bool:
 def should_enter(signal: int, current_position: Optional[dict]) -> bool:
     """
     Decide if we should act on a signal given the current position.
-
     signal: 1 = BUY, -1 = SELL, 0 = HOLD
-    Returns True if we should enter/flip/close.
     """
     if signal == 0:
         return False
 
     if current_position is None:
-        # No position — enter on any non-zero signal
         return True
 
     pos_side = current_position.get("side", "")
@@ -391,5 +508,4 @@ def should_enter(signal: int, current_position: Optional[dict]) -> bool:
         logger.debug("Already SHORT — skipping SELL signal.")
         return False
 
-    # Opposite signal — we'll flip (close existing + open new)
     return True

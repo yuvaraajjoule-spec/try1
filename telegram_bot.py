@@ -5,7 +5,7 @@ Everything controlled via inline keyboard buttons on your phone.
 Screens:
   🏠 Dashboard  →  live price, position, uPnL, TODAY'S P&L
   📊 Status     →  full account details
-  ⚡️ Settings   →  tap any setting to change it inline
+  ⚡️ Settings   →  tap any setting to change it inline (Hydra Engine params)
   🛡 Risk       →  pause, resume, dry run, close position
   📅 P&L        →  today's realised P&L, trade count, loss cap usage
   📄 Logs       →  last 25 log lines
@@ -97,11 +97,14 @@ def settings_kb():
         [("📊 Candle Limit", "set_limit"),      (f"Now: {cfg.candle_limit}", "noop")],
         [("⏰ Poll Interval", "set_interval"),  (f"Now: {cfg.poll_interval}s", "noop")],
         [("💸 Max Daily Loss", "set_maxloss"),  (f"Now: ${cfg.max_daily_loss_usdc}", "noop")],
-        [("── SMC Strategy ──", "noop")],
-        [("🔢 Min BOS Count", "set_bos"),       (f"Now: {cfg.min_bos_count}", "noop")],
-        [("📏 Swing Length", "set_swing"),       (f"Now: {cfg.swing_length}", "noop")],
-        [("📈 ST ATR Period", "set_statr"),      (f"Now: {cfg.supertrend_atr_period}", "noop")],
-        [("📉 ST Multiplier", "set_stmult"),     (f"Now: {cfg.supertrend_multiplier}", "noop")],
+        [("── 🐉 Hydra Engine ──", "noop")],
+        [("🎯 Signal Threshold", "set_threshold"), (f"Now: {cfg.signal_threshold}", "noop")],
+        [("📈 EMA Fast", "set_ema"),             (f"Now: {cfg.ema_fast}", "noop")],
+        [("📉 RSI Period", "set_rsi"),            (f"Now: {cfg.rsi_period}", "noop")],
+        [("📊 BB Period", "set_bb"),              (f"Now: {cfg.bb_period}", "noop")],
+        [("🔄 Trail ATR Mult", "set_trail"),      (f"Now: {cfg.trailing_atr_mult}x", "noop")],
+        [("⏱ Max Hold", "set_maxhold"),           (f"Now: {cfg.max_hold_candles}", "noop")],
+        [("⏸ Cooldown", "set_cooldown"),          (f"Now: {cfg.cooldown_candles}", "noop")],
         [("🌐 Network: " + net, "toggle_network")],
         [("🏠 Back", "home")],
     )
@@ -189,16 +192,16 @@ async def _dashboard_text(client=None) -> str:
     dry_tag    = " | 🔵 <b>DRY RUN</b>" if cfg.dry_run  else ""
 
     return (
-        f"🤖 <b>dYdX SMC Bot</b>  <i>{now}</i>{paused_tag}{dry_tag}\n"
+        f"🐉 <b>dYdX Hydra Bot</b>  <i>{now}</i>{paused_tag}{dry_tag}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🌐 Network  : <code>{cfg.network.upper()}</code>\n"
         f"📈 Market   : <code>{cfg.symbol}</code>\n"
         f"⏱ Timeframe: <code>{cfg.candle_resolution}</code>\n"
         f"📐 Leverage : <code>{cfg.leverage}x</code>  |  💵 <code>{cfg.position_size_pct*100:.0f}% of equity</code>\n"
         f"🛡 SL: <code>{cfg.stop_loss_pct*100:.1f}%</code>  |  "
-        f"📤 Exit: <code>CHOCH-based</code>\n"
-        f"🔢 BOS: <code>{cfg.min_bos_count}</code>  |  "
-        f"📈 ST: <code>{cfg.supertrend_atr_period}/{cfg.supertrend_multiplier}</code>\n"
+        f"📤 Exit: <code>Trailing + Score reversal</code>\n"
+        f"🎯 Threshold: <code>{cfg.signal_threshold}</code>  |  "
+        f"🔄 Trail: <code>{cfg.trailing_atr_mult}x ATR</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 Balance  : <code>{bal_str}</code>\n"
         f"₿  BTC Price: <code>{price_str}</code>\n"
@@ -411,10 +414,13 @@ _SET_PROMPTS = {
     "set_limit":     ("set_limit",     "candle_limit",         "📊 Enter candle limit:\nExample: <code>100</code>"),
     "set_interval":  ("set_interval",  "poll_interval",        "⏰ Enter poll interval in seconds:\nExample: <code>60</code>"),
     "set_maxloss":   ("set_maxloss",   "max_daily_loss_usdc",  "💸 Enter max daily loss (USDC):\nExample: <code>100</code>"),
-    "set_bos":       ("set_bos",       "min_bos_count",        "🔢 Min BOS before CHOCH triggers signal (1–10):\nExample: <code>2</code>"),
-    "set_swing":     ("set_swing",     "swing_length",         "📏 Swing detection lookback bars (2–50):\nExample: <code>5</code>"),
-    "set_statr":     ("set_statr",     "supertrend_atr_period", "📈 SuperTrend ATR period (1–50):\nExample: <code>10</code>"),
-    "set_stmult":    ("set_stmult",    "supertrend_multiplier", "📉 SuperTrend ATR multiplier (0.5–10):\nExample: <code>3.0</code>"),
+    "set_threshold": ("set_threshold", "signal_threshold",     "🎯 Signal threshold (20–95):\nHigher = fewer but stronger signals\nExample: <code>60</code>"),
+    "set_ema":       ("set_ema",       "ema_fast",             "📈 EMA fast period (3–20):\nExample: <code>8</code>"),
+    "set_rsi":       ("set_rsi",       "rsi_period",           "📉 RSI period (3–21):\nExample: <code>7</code>"),
+    "set_bb":        ("set_bb",        "bb_period",            "📊 Bollinger Band period (10–50):\nExample: <code>20</code>"),
+    "set_trail":     ("set_trail",     "trailing_atr_mult",    "🔄 Trailing stop ATR multiplier (0.5–5.0):\nExample: <code>1.5</code>"),
+    "set_maxhold":   ("set_maxhold",   "max_hold_candles",     "⏱ Max candles to hold a position (3–120):\nExample: <code>15</code>"),
+    "set_cooldown":  ("set_cooldown",  "cooldown_candles",     "⏸ Cooldown candles after a loss (0–20):\nExample: <code>2</code>"),
 }
 
 async def _start_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
