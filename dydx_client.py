@@ -7,7 +7,6 @@ Verified against dydx-v4-client==1.1.0 source at:
 https://github.com/dydxprotocol/v4-clients/tree/main/v4-client-py-v2
 """
 
-import asyncio
 import logging
 import os
 from typing import Optional
@@ -235,8 +234,7 @@ class DydxClient:
 
         logger.debug(f"Fetching {limit} × {resolution} candles for {symbol}...")
 
-        response = await asyncio.to_thread(
-            self.indexer.markets.get_candles,
+        response = await self.indexer.markets.get_perpetual_market_candles(
             market=symbol,
             resolution=resolution,
             limit=limit,
@@ -263,9 +261,7 @@ class DydxClient:
     async def get_orderbook(self, symbol: Optional[str] = None) -> dict:
         """Get best bid/ask from the orderbook."""
         symbol = symbol or self.symbol
-        ob = await asyncio.to_thread(
-            self.indexer.markets.get_orderbook, market=symbol
-        )
+        ob = await self.indexer.markets.get_perpetual_market_orderbook(market=symbol)
         best_bid = float(ob["bids"][0]["price"]) if ob.get("bids") else None
         best_ask = float(ob["asks"][0]["price"]) if ob.get("asks") else None
         return {"bid": best_bid, "ask": best_ask}
@@ -275,8 +271,7 @@ class DydxClient:
     # -------------------------------------------------------
     async def get_account(self) -> dict:
         """Return subaccount info (equity, freeCollateral, etc.)."""
-        resp = await asyncio.to_thread(
-            self.indexer.account.get_subaccount,
+        resp = await self.indexer.account.get_subaccount(
             address=self.address,
             subaccount_number=0,
         )
@@ -288,8 +283,7 @@ class DydxClient:
         Dict keys: side, size, entryPrice, unrealizedPnl, liquidationPrice
         """
         symbol = symbol or self.symbol
-        resp = await asyncio.to_thread(
-            self.indexer.account.get_subaccount_perpetual_positions,
+        resp = await self.indexer.account.get_subaccount_perpetual_positions(
             address=self.address,
             subaccount_number=0,
             status="OPEN",
@@ -322,10 +316,9 @@ class DydxClient:
         if self.dry_run:
             return {"status": "DRY_RUN", "side": side, "size": size}
 
-        market_info = await asyncio.to_thread(
-            self.indexer.markets.get_perpetual_market, self.symbol
-        )
-        market = Market(market_info["market"])
+        markets_resp = await self.indexer.markets.get_perpetual_markets(market=self.symbol)
+        market_info = markets_resp.get("markets", {}).get(self.symbol, {})
+        market = Market(market_info)
 
         order_id = market.order_id(
             address=self.address,

@@ -24,7 +24,7 @@ CONFIG_FILE = Path("runtime_config.json")
 _DEFAULTS = {
     "network":              os.getenv("DYDX_NETWORK", "mainnet"),
     "symbol":               os.getenv("TRADE_SYMBOL", "BTC-USD"),
-    "candle_resolution":    os.getenv("CANDLE_RESOLUTION", "15MINS"),
+    "candle_resolution":    os.getenv("CANDLE_RESOLUTION", "1MIN"),
     "candle_limit":         int(os.getenv("CANDLE_LIMIT", 100)),
     "poll_interval":        int(os.getenv("POLL_INTERVAL_SECONDS", 60)),
     "position_size_usdc":   float(os.getenv("POSITION_SIZE_USDC", 50)),
