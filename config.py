@@ -35,16 +35,16 @@ _DEFAULTS = {
     "dry_run":              os.getenv("DRY_RUN", "false").lower() == "true",
     "paused":               False,
     "log_level":            os.getenv("LOG_LEVEL", "INFO"),
-    # ── Hydra Engine Parameters ──
-    "signal_threshold":     int(os.getenv("SIGNAL_THRESHOLD", 60)),
+    # ── SuperTrend Sniper Parameters ──
+    "st_atr_period":        int(os.getenv("ST_ATR_PERIOD", 10)),
+    "st_multiplier":        float(os.getenv("ST_MULTIPLIER", 3.0)),
+    "st_use_true_atr":      os.getenv("ST_USE_TRUE_ATR", "true").lower() == "true",
     "trailing_atr_mult":    float(os.getenv("TRAILING_ATR_MULT", 1.5)),
-    "max_hold_candles":     int(os.getenv("MAX_HOLD_CANDLES", 15)),
+    "max_hold_candles":     int(os.getenv("MAX_HOLD_CANDLES", 60)),
     "partial_tp_pct":       float(os.getenv("PARTIAL_TP_PCT", 0.5)),
-    "cooldown_candles":     int(os.getenv("COOLDOWN_CANDLES", 2)),
-    "ema_fast":             int(os.getenv("EMA_FAST", 8)),
-    "rsi_period":           int(os.getenv("RSI_PERIOD", 7)),
-    "bb_period":            int(os.getenv("BB_PERIOD", 20)),
-    "adaptive_threshold":   os.getenv("ADAPTIVE_THRESHOLD", "true").lower() == "true",
+    "cooldown_candles":     int(os.getenv("COOLDOWN_CANDLES", 1)),
+    "fee_filter_enabled":   os.getenv("FEE_FILTER_ENABLED", "true").lower() == "true",
+    "estimated_fee_pct":    float(os.getenv("ESTIMATED_FEE_PCT", 0.05)),
     # Dry-run simulation
     "dry_run_equity":       float(os.getenv("DRY_RUN_EQUITY", 1000.0)),
 }
@@ -72,8 +72,9 @@ class _Config:
         if CONFIG_FILE.exists():
             try:
                 saved = json.loads(CONFIG_FILE.read_text())
-                # Remove old SMC keys that no longer exist
-                old_keys = {"min_bos_count", "swing_length", "supertrend_atr_period", "supertrend_multiplier"}
+                # Remove old Hydra/SMC keys that no longer exist
+                old_keys = {"min_bos_count", "swing_length", "supertrend_atr_period", "supertrend_multiplier",
+                            "signal_threshold", "ema_fast", "rsi_period", "bb_period", "adaptive_threshold"}
                 for k in old_keys:
                     saved.pop(k, None)
                 self._data = {**_DEFAULTS, **saved}
@@ -136,22 +137,20 @@ class _Config:
             raise ValueError("Stop loss must be between 0.1% and 50%")
         if key == "take_profit_pct" and not (0.001 <= float(value) <= 1.0):
             raise ValueError("Take profit must be between 0.1% and 100%")
-        if key == "signal_threshold" and not (20 <= int(value) <= 95):
-            raise ValueError("Signal threshold must be between 20 and 95")
+        if key == "st_atr_period" and not (5 <= int(value) <= 50):
+            raise ValueError("SuperTrend ATR period must be between 5 and 50")
+        if key == "st_multiplier" and not (0.5 <= float(value) <= 10.0):
+            raise ValueError("SuperTrend multiplier must be between 0.5 and 10.0")
         if key == "trailing_atr_mult" and not (0.5 <= float(value) <= 5.0):
             raise ValueError("Trailing ATR multiplier must be between 0.5 and 5.0")
-        if key == "max_hold_candles" and not (3 <= int(value) <= 120):
-            raise ValueError("Max hold candles must be between 3 and 120")
+        if key == "max_hold_candles" and not (3 <= int(value) <= 500):
+            raise ValueError("Max hold candles must be between 3 and 500")
         if key == "partial_tp_pct" and not (0.1 <= float(value) <= 0.9):
             raise ValueError("Partial TP % must be between 10% and 90%")
         if key == "cooldown_candles" and not (0 <= int(value) <= 20):
             raise ValueError("Cooldown candles must be between 0 and 20")
-        if key == "ema_fast" and not (3 <= int(value) <= 20):
-            raise ValueError("EMA fast period must be between 3 and 20")
-        if key == "rsi_period" and not (3 <= int(value) <= 21):
-            raise ValueError("RSI period must be between 3 and 21")
-        if key == "bb_period" and not (10 <= int(value) <= 50):
-            raise ValueError("BB period must be between 10 and 50")
+        if key == "estimated_fee_pct" and not (0.001 <= float(value) <= 1.0):
+            raise ValueError("Estimated fee must be between 0.001% and 1.0%")
         if key == "dry_run_equity" and not (10.0 <= float(value) <= 1000000.0):
             raise ValueError("Dry-run equity must be between $10 and $1,000,000")
 

@@ -237,44 +237,6 @@ def reset_hold_counter():
 
 
 # -----------------------------------------------------------
-# Adaptive Threshold
-# -----------------------------------------------------------
-
-def get_adaptive_threshold(base_threshold: int) -> int:
-    """
-    Auto-adjust signal threshold based on recent win rate.
-    Win rate < 50% → increase threshold (more conservative)
-    Win rate > 65% → decrease threshold (more aggressive)
-    """
-    state = _get_daily_state()
-    trades = state.get("trades", [])
-
-    if len(trades) < 5:
-        return base_threshold  # not enough data
-
-    recent = trades[-20:]  # last 20 trades
-    wins = sum(1 for t in recent if t.get("pnl_usdc", 0) > 0)
-    win_rate = wins / len(recent)
-
-    if win_rate < 0.40:
-        adjusted = min(base_threshold + 15, 90)
-        logger.debug(f"Adaptive threshold: WR {win_rate:.0%} → raised to {adjusted}")
-        return adjusted
-    elif win_rate < 0.50:
-        adjusted = min(base_threshold + 8, 85)
-        return adjusted
-    elif win_rate > 0.70:
-        adjusted = max(base_threshold - 10, 30)
-        logger.debug(f"Adaptive threshold: WR {win_rate:.0%} → lowered to {adjusted}")
-        return adjusted
-    elif win_rate > 0.60:
-        adjusted = max(base_threshold - 5, 35)
-        return adjusted
-
-    return base_threshold
-
-
-# -----------------------------------------------------------
 # Dry-Run Simulation Tracking
 # -----------------------------------------------------------
 

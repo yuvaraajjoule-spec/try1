@@ -1,12 +1,13 @@
 """
 bot.py — Main Trading Bot Entry Point
-Runs the Hydra Engine strategy on dYdX BTC-USD 24/7.
+Runs the SuperTrend Sniper strategy on dYdX BTC-USD 24/7.
 All settings are read live from config.cfg so Telegram changes
 take effect on the next poll cycle without a restart.
 
-Strategy: Hydra Engine — 7-indicator weighted voting system
-  - Entry: When aggregate score crosses adaptive threshold
-  - Exit: Trailing stop / Partial TP / Score reversal / Time-based / Emergency SL
+Strategy: SuperTrend Sniper — Pure SuperTrend flip trading
+  - Entry: Every SuperTrend trend flip = trade
+  - Exit: SuperTrend band (natural trailing stop) / Opposite flip / Emergency SL
+  - Fee-aware: Only enters when ATR > 2× round-trip fee cost
 
 Deployment: Render.com (free tier)
   - A Flask keep-alive server runs on PORT (default 8080) in a background thread.
@@ -37,7 +38,6 @@ from logic import generate_signal
 from risk import (
     calculate_position_size,
     calculate_sl,
-    get_adaptive_threshold,
     get_trailing_sl,
     increment_hold_counter,
     init_dry_run_equity,
@@ -133,35 +133,32 @@ def _clear_open_trade():
 
 async def trading_loop(client: DydxClient):
     """
-    Infinite poll loop:
+    Infinite poll loop — SuperTrend Sniper:
       1. Check pause flag
       2. Fetch candles
-      3. Run Hydra Engine signal generation
-      4. Handle exits (trailing stop, score reversal, time-based)
-      5. Handle entries (new signal above threshold)
+      3. Run SuperTrend signal generation
+      4. Handle exits (SuperTrend band stop, time-based)
+      5. Handle entries — every flip = trade (close + open opposite)
       6. Risk checks (daily loss, cooldown, existing position)
     """
-    # Determine effective threshold
-    threshold = cfg.signal_threshold
-    if cfg.adaptive_threshold:
-        threshold = get_adaptive_threshold(threshold)
-
     logger.info("=" * 60)
-    logger.info("  dYdX Hydra Engine Trading Bot — STARTED")
+    logger.info("  dYdX SuperTrend Sniper — STARTED")
     logger.info(f"  Network    : {cfg.network}")
     logger.info(f"  Symbol     : {cfg.symbol}")
     logger.info(f"  TF         : {cfg.candle_resolution}")
     logger.info(f"  Interval   : {cfg.poll_interval}s")
     logger.info(f"  Dry Run    : {cfg.dry_run}")
-    logger.info(f"  Strategy   : Hydra Engine (threshold={threshold})")
+    logger.info(f"  Strategy   : SuperTrend (ATR={cfg.st_atr_period}, Mult={cfg.st_multiplier})")
+    logger.info(f"  Fee Filter : {cfg.fee_filter_enabled} ({cfg.estimated_fee_pct}%)")
     logger.info(f"  Trail ATR  : {cfg.trailing_atr_mult}x | Max Hold: {cfg.max_hold_candles} candles")
     logger.info("=" * 60)
 
     await send_alert(
-        f"🐉 <b>dYdX Hydra Bot STARTED</b>\n"
+        f"⚡ <b>dYdX SuperTrend Sniper STARTED</b>\n"
         f"Network: <code>{cfg.network.upper()}</code> | Symbol: <code>{cfg.symbol}</code>\n"
-        f"Strategy: <code>Hydra Engine (7-head voting)</code>\n"
-        f"Threshold: <code>{threshold}</code> | Trail: <code>{cfg.trailing_atr_mult}x ATR</code>\n"
+        f"Strategy: <code>SuperTrend (ATR={cfg.st_atr_period}, ×{cfg.st_multiplier})</code>\n"
+        f"Fee Filter: <code>{'ON' if cfg.fee_filter_enabled else 'OFF'} ({cfg.estimated_fee_pct}%)</code>\n"
+        f"Trail: <code>{cfg.trailing_atr_mult}x ATR</code>\n"
         f"Dry Run: <code>{cfg.dry_run}</code>\n\n"
         f"Send /start to open the control panel."
     )
@@ -186,20 +183,16 @@ async def trading_loop(client: DydxClient):
                 limit=cfg.candle_limit,
             )
 
-            # ── 2. Compute adaptive threshold ────────────────
-            threshold = cfg.signal_threshold
-            if cfg.adaptive_threshold:
-                threshold = get_adaptive_threshold(threshold)
-
-            # ── 3. Hydra Engine signal ───────────────────────
+            # ── 2. SuperTrend signal ─────────────────────────
             result = generate_signal(
                 df,
-                signal_threshold=threshold,
-                ema_fast=cfg.ema_fast,
-                rsi_period=cfg.rsi_period,
-                bb_period=cfg.bb_period,
+                st_atr_period=cfg.st_atr_period,
+                st_multiplier=cfg.st_multiplier,
+                st_use_true_atr=cfg.st_use_true_atr,
                 trailing_atr_mult=cfg.trailing_atr_mult,
                 max_hold_candles=cfg.max_hold_candles,
+                fee_filter_enabled=cfg.fee_filter_enabled,
+                estimated_fee_pct=cfg.estimated_fee_pct,
             )
 
             latest_close = df["close"].iloc[-1]
@@ -209,12 +202,12 @@ async def trading_loop(client: DydxClient):
 
             logger.info(
                 f"Price: ${latest_close:,.2f} | Signal: {label} | "
-                f"Score: {result.score:+.1f}/{threshold} | "
                 f"Regime: {regime_icon} {result.regime} | "
-                f"ATR: {result.atr:.2f}"
+                f"ATR: {result.atr:.2f} | "
+                f"ST Band: ${result.trailing_sl:,.2f}"
             )
 
-            # ── 4. Handle exit signals ───────────────────────
+            # ── 3. Handle existing position ──────────────────
             current_position = await client.get_position()
             open_trade = _read_open_trade()
 
@@ -224,13 +217,14 @@ async def trading_loop(client: DydxClient):
                 pos_size = abs(float(current_position.get("size", 0)))
                 trade_atr = open_trade.get("atr", result.atr)
 
-                # Update trailing stop
+                # Update trailing stop using SuperTrend band
                 current_tsl = get_trailing_sl()
-                if current_tsl > 0 or signal != 0:
-                    new_tsl = update_trailing_stop(
-                        latest_close, "BUY" if pos_side == "LONG" else "SELL",
-                        entry_price, trade_atr, current_tsl,
-                    )
+                if result.trailing_sl > 0:
+                    # Use SuperTrend band as the natural trailing stop
+                    if pos_side == "LONG":
+                        new_tsl = max(result.trailing_sl, current_tsl) if current_tsl > 0 else result.trailing_sl
+                    else:
+                        new_tsl = min(result.trailing_sl, current_tsl) if current_tsl > 0 else result.trailing_sl
                     if new_tsl != current_tsl:
                         save_trailing_sl(new_tsl)
                         logger.debug(f"Trailing SL updated: ${current_tsl:.2f} → ${new_tsl:.2f}")
@@ -243,14 +237,12 @@ async def trading_loop(client: DydxClient):
                 should_exit = False
                 exit_reason = ""
 
-                # a) Score reversal exit
-                if result.exit_signal:
-                    if pos_side == "LONG" and result.exit_reason == "score_reversal_bearish":
+                # a) SuperTrend flip exit — opposite signal received
+                if signal != 0:
+                    if (pos_side == "LONG" and signal == -1) or \
+                       (pos_side == "SHORT" and signal == 1):
                         should_exit = True
-                        exit_reason = "score_reversal"
-                    elif pos_side == "SHORT" and result.exit_reason == "score_reversal_bullish":
-                        should_exit = True
-                        exit_reason = "score_reversal"
+                        exit_reason = "supertrend_flip"
 
                 # b) Time-based exit
                 if candles_held >= cfg.max_hold_candles:
@@ -260,7 +252,6 @@ async def trading_loop(client: DydxClient):
                 # c) Partial TP (close half at 1× ATR profit)
                 if not open_trade.get("partial_tp_done", False) and trade_atr > 0:
                     if pos_side == "LONG" and latest_close >= entry_price + trade_atr:
-                        # Close partial
                         partial_size = round(pos_size * cfg.partial_tp_pct, 4)
                         if partial_size >= 0.0001:
                             logger.info(f"📊 Partial TP hit! Closing {cfg.partial_tp_pct*100:.0f}% ({partial_size} BTC)")
@@ -318,38 +309,46 @@ async def trading_loop(client: DydxClient):
                             f"Held   : <code>{candles_held} candles</code>"
                         )
 
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1)
                     current_position = None
 
+                    # If exit was a flip, immediately re-enter opposite direction
+                    if exit_reason == "supertrend_flip":
+                        # Don't sleep — proceed to entry logic below
+                        pass
+                    else:
+                        await asyncio.sleep(cfg.poll_interval)
+                        continue
+
             # ── Handle dry-run exit ──────────────────────────
-            if cfg.dry_run and result.exit_signal:
-                open_trade = _read_open_trade()
-                if open_trade:
-                    pos_side_check = open_trade.get("side", "")
-                    should_dry_exit = False
-                    if pos_side_check == "BUY" and result.exit_reason == "score_reversal_bearish":
-                        should_dry_exit = True
-                    elif pos_side_check == "SELL" and result.exit_reason == "score_reversal_bullish":
-                        should_dry_exit = True
+            if cfg.dry_run and open_trade:
+                dry_should_exit = False
+                pos_side_check = open_trade.get("side", "")
 
-                    candles_held = open_trade.get("candles_held", 0)
-                    if candles_held >= cfg.max_hold_candles:
-                        should_dry_exit = True
+                # SuperTrend flip exit
+                if signal != 0:
+                    if (pos_side_check == "BUY" and signal == -1) or \
+                       (pos_side_check == "SELL" and signal == 1):
+                        dry_should_exit = True
 
-                    if should_dry_exit:
-                        dry_exit = record_dry_run_exit(latest_close)
-                        if dry_exit:
-                            _clear_open_trade()
-                            await send_alert(
-                                f"🔵 [DRY RUN] 📤 <b>Exit</b>\n"
-                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                                f"Side   : <code>{dry_exit['side']}</code>\n"
-                                f"Entry  : <code>${dry_exit['entry']:,.2f}</code>\n"
-                                f"Exit   : <code>${dry_exit['exit']:,.2f}</code>\n"
-                                f"PnL    : <code>${dry_exit['pnl_usdc']:+.2f} ({dry_exit['pnl_pct']:+.2f}%)</code>"
-                            )
+                candles_held = open_trade.get("candles_held", 0)
+                if candles_held >= cfg.max_hold_candles:
+                    dry_should_exit = True
 
-            # ── 5. Risk checks ────────────────────────────────
+                if dry_should_exit:
+                    dry_exit = record_dry_run_exit(latest_close)
+                    if dry_exit:
+                        _clear_open_trade()
+                        await send_alert(
+                            f"🔵 [DRY RUN] 📤 <b>Exit</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"Side   : <code>{dry_exit['side']}</code>\n"
+                            f"Entry  : <code>${dry_exit['entry']:,.2f}</code>\n"
+                            f"Exit   : <code>${dry_exit['exit']:,.2f}</code>\n"
+                            f"PnL    : <code>${dry_exit['pnl_usdc']:+.2f} ({dry_exit['pnl_pct']:+.2f}%)</code>"
+                        )
+
+            # ── 4. Risk checks ────────────────────────────────
             if is_daily_loss_limit_hit():
                 logger.warning("Daily loss limit hit — skipping cycle.")
                 await asyncio.sleep(cfg.poll_interval)
@@ -365,18 +364,15 @@ async def trading_loop(client: DydxClient):
                 consecutive_errors = 0
                 continue
 
-            # ── 6. New entry ──────────────────────────────────
+            # ── 5. New entry ──────────────────────────────────
             if signal != 0:
-                votes_str = " | ".join(
-                    f"{k}:{v:+.2f}" for k, v in result.indicator_votes.items()
-                )
                 confluence_str = ", ".join(result.confluence[:5]) if result.confluence else "none"
                 await send_alert(
-                    f"📡 <b>New Signal: {label}</b>\n"
+                    f"⚡ <b>SuperTrend Flip: {label}</b>\n"
                     f"Price: <code>${latest_close:,.2f}</code>\n"
-                    f"Score: <code>{result.score:+.1f}/{threshold}</code>\n"
+                    f"ATR: <code>{result.atr:.2f}</code>\n"
                     f"Regime: <code>{result.regime}</code>\n"
-                    f"Votes: <code>{votes_str}</code>\n"
+                    f"ST Band: <code>${result.trailing_sl:,.2f}</code>\n"
                     f"Confluence: <code>{confluence_str}</code>"
                 )
 
@@ -388,7 +384,7 @@ async def trading_loop(client: DydxClient):
                     logger.info(f"Flipping {pos_side} → closing first...")
                     await client.close_position()
                     _clear_open_trade()
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1)
 
             # Fetch equity for sizing
             try:
@@ -414,18 +410,20 @@ async def trading_loop(client: DydxClient):
 
             if result_order:
                 entry_price = latest_close
-                sl_price = calculate_sl(entry_price, order_side, atr=result.atr)
+                # Use SuperTrend band as initial SL, with ATR-based fallback
+                sl_price = result.trailing_sl if result.trailing_sl > 0 else \
+                           calculate_sl(entry_price, order_side, atr=result.atr)
 
                 # Save trailing SL
                 save_trailing_sl(sl_price)
 
                 logger.info(
                     f"✅ Order | Entry: ${entry_price:,.2f} | "
-                    f"SL: ${sl_price:,.2f} | Trail: {cfg.trailing_atr_mult}x ATR"
+                    f"SL: ${sl_price:,.2f} (SuperTrend band)"
                 )
                 _write_open_trade(
                     order_side, entry_price, sl_price, size_btc,
-                    signal_info=f"score={result.score:+.1f}",
+                    signal_info=f"ST_flip|ATR={result.atr:.2f}",
                     atr=result.atr,
                 )
 
@@ -443,8 +441,8 @@ async def trading_loop(client: DydxClient):
                     f"Leverage    : <code>{cfg.leverage}x</code>\n"
                     f"Entry       : <code>${entry_price:,.2f}</code>\n"
                     f"SL          : <code>${sl_price:,.2f}</code>\n"
-                    f"Exit        : <code>Trailing stop + Score reversal</code>\n"
-                    f"Score       : <code>{result.score:+.1f}</code>\n"
+                    f"Exit        : <code>SuperTrend flip + Trailing band</code>\n"
+                    f"ATR         : <code>{result.atr:.2f}</code>\n"
                     f"Regime      : <code>{result.regime}</code>"
                 )
 
@@ -473,15 +471,14 @@ async def trading_loop(client: DydxClient):
 
 
 # -----------------------------------------------------------
-# Trailing SL Monitor (replaces old SL-only monitor)
+# Trailing SL Monitor (SuperTrend band-based)
 # -----------------------------------------------------------
 
 async def sl_monitor(client: DydxClient):
     """
     Checks every 5 seconds:
-      1. Trailing stop hit?
+      1. SuperTrend trailing stop hit?
       2. Emergency SL hit?
-    Updates trailing SL based on current price.
     """
     while True:
         try:
@@ -497,23 +494,14 @@ async def sl_monitor(client: DydxClient):
                 await asyncio.sleep(5)
                 continue
 
-            # Update trailing stop
-            entry = trade.get("entry", 0)
-            atr = trade.get("atr", 0)
-            current_tsl = get_trailing_sl()
-            if current_tsl > 0 and atr > 0:
-                new_tsl = update_trailing_stop(price, trade["side"], entry, atr, current_tsl)
-                if new_tsl != current_tsl:
-                    save_trailing_sl(new_tsl)
-
-            # Check trailing SL
+            # Check trailing SL (SuperTrend band)
             effective_sl = get_trailing_sl() if get_trailing_sl() > 0 else trade.get("sl", 0)
 
             hit_sl = (trade["side"] == "BUY" and price <= effective_sl) or \
                      (trade["side"] == "SELL" and price >= effective_sl)
 
             if hit_sl:
-                logger.info(f"🛑 Trailing Stop hit at ${price:,.2f} (SL: ${effective_sl:,.2f})")
+                logger.info(f"🛑 SuperTrend Stop hit at ${price:,.2f} (SL: ${effective_sl:,.2f})")
                 await client.close_position()
                 pnl = (price - trade["entry"]) * trade["size"] * \
                       (1 if trade["side"] == "BUY" else -1)
@@ -532,7 +520,7 @@ async def sl_monitor(client: DydxClient):
                     record_dry_run_exit(price)
 
                 await send_alert(
-                    f"🛑 <b>Trailing Stop Hit!</b>\n"
+                    f"🛑 <b>SuperTrend Stop Hit!</b>\n"
                     f"Price: <code>${price:,.2f}</code> | SL: <code>${effective_sl:,.2f}</code>\n"
                     f"PnL: <code>${pnl:+.2f} ({pnl_pct:+.2f}%)</code>"
                 )
@@ -548,7 +536,7 @@ async def sl_monitor(client: DydxClient):
 # -----------------------------------------------------------
 
 async def main():
-    parser = argparse.ArgumentParser(description="dYdX Hydra Engine Trading Bot")
+    parser = argparse.ArgumentParser(description="dYdX SuperTrend Sniper Trading Bot")
     parser.add_argument("--dry-run", action="store_true",
                         help="Simulate trades without placing real orders")
     args = parser.parse_args()
@@ -583,7 +571,7 @@ _start_time = None
 def index():
     return jsonify({
         "status": "running",
-        "service": "dYdX Hydra Engine Trading Bot",
+        "service": "dYdX SuperTrend Sniper Trading Bot",
         "message": "Bot is alive and trading. Visit /health for uptime info."
     })
 
@@ -597,7 +585,7 @@ def health():
     return jsonify({
         "status": "ok",
         "uptime": f"{hours}h {minutes}m {seconds}s",
-        "service": "dYdX Hydra Engine Trading Bot",
+        "service": "dYdX SuperTrend Sniper Trading Bot",
         "network": os.getenv("DYDX_NETWORK", "mainnet"),
         "dry_run": os.getenv("DRY_RUN", "true"),
     })
