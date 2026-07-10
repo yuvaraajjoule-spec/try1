@@ -97,14 +97,9 @@ def settings_kb():
         [("📊 Candle Limit", "set_limit"),      (f"Now: {cfg.candle_limit}", "noop")],
         [("⏰ Poll Interval", "set_interval"),  (f"Now: {cfg.poll_interval}s", "noop")],
         [("💸 Max Daily Loss", "set_maxloss"),  (f"Now: ${cfg.max_daily_loss_usdc}", "noop")],
-        [("── ⚡ SuperTrend Sniper ──", "noop")],
+        [("── ⚡ SuperTrend ──", "noop")],
         [("📊 ATR Period", "set_atr_period"),     (f"Now: {cfg.st_atr_period}", "noop")],
         [("✖️ Multiplier", "set_multiplier"),     (f"Now: {cfg.st_multiplier}x", "noop")],
-        [("🔄 Trail ATR Mult", "set_trail"),      (f"Now: {cfg.trailing_atr_mult}x", "noop")],
-        [("⏱ Max Hold", "set_maxhold"),           (f"Now: {cfg.max_hold_candles}", "noop")],
-        [("⏸ Cooldown", "set_cooldown"),          (f"Now: {cfg.cooldown_candles}", "noop")],
-        [("💸 Fee Filter", "toggle_fee_filter"),  (f"Now: {'ON' if cfg.fee_filter_enabled else 'OFF'}", "noop")],
-        [("📈 Est Fee %", "set_fee_pct"),         (f"Now: {cfg.estimated_fee_pct}%", "noop")],
         [("🌐 Network: " + net, "toggle_network")],
         [("🏠 Back", "home")],
     )
@@ -199,8 +194,6 @@ async def _dashboard_text(client=None) -> str:
         f"⏱ Timeframe: <code>{cfg.candle_resolution}</code>\n"
         f"📐 Leverage : <code>{cfg.leverage}x</code>  |  💵 <code>{cfg.position_size_pct*100:.0f}% of equity</code>\n"
         f"📊 SuperTrend: <code>ATR={cfg.st_atr_period}, ×{cfg.st_multiplier}</code>\n"
-        f"🔄 Trail: <code>{cfg.trailing_atr_mult}x ATR</code>  |  "
-        f"💸 Fee: <code>{'ON' if cfg.fee_filter_enabled else 'OFF'}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 Balance  : <code>{bal_str}</code>\n"
         f"₿  BTC Price: <code>{price_str}</code>\n"
@@ -415,10 +408,6 @@ _SET_PROMPTS = {
     "set_maxloss":   ("set_maxloss",   "max_daily_loss_usdc",  "💸 Enter max daily loss (USDC):\nExample: <code>100</code>"),
     "set_atr_period":("set_atr_period","st_atr_period",        "📊 SuperTrend ATR Period (5–50):\nLower = more sensitive, Higher = smoother\nExample: <code>10</code>"),
     "set_multiplier":("set_multiplier","st_multiplier",        "✖️ SuperTrend Multiplier (0.5–10.0):\nLower = tighter bands, more signals\nExample: <code>3.0</code>"),
-    "set_trail":     ("set_trail",     "trailing_atr_mult",    "🔄 Trailing stop ATR multiplier (0.5–5.0):\nExample: <code>1.5</code>"),
-    "set_maxhold":   ("set_maxhold",   "max_hold_candles",     "⏱ Max candles to hold a position (3–500):\nExample: <code>60</code>"),
-    "set_cooldown":  ("set_cooldown",  "cooldown_candles",     "⏸ Cooldown candles after a loss (0–20):\nExample: <code>1</code>"),
-    "set_fee_pct":   ("set_fee_pct",   "estimated_fee_pct",    "📈 Estimated dYdX taker fee % (0.001–1.0):\nUsed for fee recoup filter\nExample: <code>0.05</code>"),
 }
 
 async def _start_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -510,14 +499,6 @@ async def _toggle_network(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return SETTINGS_MENU
 
 
-async def _toggle_fee_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not _ok(update): return SETTINGS_MENU
-    cfg.set("fee_filter_enabled", not cfg.fee_filter_enabled)
-    state = "ON ✅" if cfg.fee_filter_enabled else "OFF ❌"
-    text = _settings_text() + f"\n\n<b>Fee Filter is now {state}</b>"
-    await _edit(update, text, settings_kb())
-    return SETTINGS_MENU
-
 # ── Close position flow ───────────────────────────────────────
 
 async def _confirm_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -576,7 +557,6 @@ def build_conversation() -> ConversationHandler:
             SETTINGS_MENU: [
                 *set_triggers,
                 CallbackQueryHandler(_toggle_network, pattern="^toggle_network$"),
-                CallbackQueryHandler(_toggle_fee_filter, pattern="^toggle_fee_filter$"),
                 CallbackQueryHandler(_home,           pattern="^home$"),
                 CallbackQueryHandler(_noop,           pattern="^noop$"),
                 CallbackQueryHandler(_settings,       pattern="^settings$"),
