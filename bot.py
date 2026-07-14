@@ -4,6 +4,8 @@ bot.py — dYdX SuperTrend Trading Bot
 Pure SuperTrend flip trading:
   • SuperTrend says BUY  → BUY
   • SuperTrend says SELL → SELL
+  • ONE TRADE AT A TIME: once a BUY/SELL is open, all same-direction
+    signals are ignored until the opposite signal closes the position.
   • 3-second signal confirmation (re-check after 3s before acting)
   • Skip trades when ATR is too small (not worth the fees)
   • Emergency percentage SL monitor
@@ -210,6 +212,22 @@ async def trading_loop(client: DydxClient):
             current_position = await client.get_position()
             open_trade = _read_trade()
 
+            # ── ONE TRADE AT A TIME: block same-direction re-entry ──
+            if open_trade and signal != 0:
+                open_side = open_trade.get("side", "")
+                same_direction = (
+                    (open_side == "BUY" and signal == 1) or
+                    (open_side == "SELL" and signal == -1)
+                )
+                if same_direction:
+                    logger.info(
+                        f"🚫 Ignoring {open_side} signal — already in a {open_side} trade. "
+                        f"Waiting for opposite signal to exit first."
+                    )
+                    await asyncio.sleep(cfg.poll_interval)
+                    consecutive_errors = 0
+                    continue
+
             if current_position and open_trade and signal != 0:
                 pos_side = current_position.get("side")
                 need_close = (
@@ -251,12 +269,15 @@ async def trading_loop(client: DydxClient):
                             f"{'🔵 [DRY] ' if dry else ''}📤 <b>Closed {pos_side}</b>\n"
                             f"Entry: <code>${entry_price:,.2f}</code>\n"
                             f"Exit : <code>${price:,.2f}</code>\n"
-                            f"PnL  : <code>${pnl:+.2f} ({pnl_pct:+.2f}%)</code>"
+                            f"PnL  : <code>${pnl:+.2f} ({pnl_pct:+.2f}%)</code>\n\n"
+                            f"⏳ Waiting for next fresh signal to re-enter..."
                         )
 
-                    await asyncio.sleep(1)
-                    current_position = None
-                    # Fall through to open opposite direction below
+                    # ── ONE TRADE AT A TIME: do NOT immediately open opposite.
+                    # Wait for the next clean signal on the next poll cycle. ──
+                    await asyncio.sleep(cfg.poll_interval)
+                    consecutive_errors = 0
+                    continue
 
             # ── Handle dry-run exit (no real position to check) ──
             if cfg.dry_run and open_trade and signal != 0:
@@ -274,8 +295,14 @@ async def trading_loop(client: DydxClient):
                             f"Side : <code>{dry_exit['side']}</code>\n"
                             f"Entry: <code>${dry_exit['entry']:,.2f}</code>\n"
                             f"Exit : <code>${dry_exit['exit']:,.2f}</code>\n"
-                            f"PnL  : <code>${dry_exit['pnl_usdc']:+.2f} ({dry_exit['pnl_pct']:+.2f}%)</code>"
+                            f"PnL  : <code>${dry_exit['pnl_usdc']:+.2f} ({dry_exit['pnl_pct']:+.2f}%)</code>\n\n"
+                            f"⏳ Waiting for next fresh signal to re-enter..."
                         )
+                    # ── ONE TRADE AT A TIME (dry-run): do NOT immediately open
+                    # the opposite position. Wait for the next clean signal. ──
+                    await asyncio.sleep(cfg.poll_interval)
+                    consecutive_errors = 0
+                    continue
 
             # ── 4. Should we enter? ──
             if not should_enter(signal, current_position):
